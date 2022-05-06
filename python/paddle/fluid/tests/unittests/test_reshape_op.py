@@ -17,11 +17,12 @@ from __future__ import print_function
 import unittest
 import numpy as np
 
-from op_test import OpTest
+from op_test import OpTest, convert_float_to_uint16
 import paddle
 import paddle.fluid as fluid
 from paddle.fluid import compiler
 from paddle.static import Program, program_guard
+import paddle.fluid.core as core
 
 
 # situation 1: have shape( list, no tensor), no actual shape(Tensor)
@@ -34,6 +35,33 @@ class TestReshapeOp(OpTest):
         self.outputs = {
             "Out": self.inputs["X"].reshape(self.infered_shape),
             'XShape': np.random.random(self.ori_shape).astype("float32")
+        }
+
+    def init_data(self):
+        self.ori_shape = (2, 60)
+        self.new_shape = (12, 10)
+        self.infered_shape = (12, 10)
+
+    def test_check_output(self):
+        self.check_output(no_check_set=['XShape'])
+
+    def test_check_grad(self):
+        self.check_grad(["X"], "Out")
+
+
+class TestReshapeBF16Op(OpTest):
+    def setUp(self):
+        self.init_data()
+        self.op_type = "reshape2"
+        self.dtype = np.uint16
+        x = np.random.random(self.ori_shape).astype("float32")
+        out = x.reshape(self.infered_shape)
+        self.inputs = {"X": convert_float_to_uint16(x)}
+        self.attrs = {"shape": self.new_shape}
+        self.outputs = {
+            "Out": convert_float_to_uint16(out),
+            'XShape': convert_float_to_uint16(
+                np.random.random(self.ori_shape).astype("float32"))
         }
 
     def init_data(self):
@@ -464,5 +492,20 @@ class TestDygraphReshapeInplaceAPI(TestDygraphReshapeAPI):
         self.reshape = paddle.reshape_
 
 
+class TestReshapeZeroTensor(unittest.TestCase):
+    def test_reshape_zero_tensor_success(self):
+        zero_tensor = paddle.zeros([0, 2, 3])
+        # since we use "0" as the dimension copy semantically in reshape, 
+        # we need to copy the 0 dim in the src tensor in order to make a successful zero tensor reshape
+        zero_tensor = zero_tensor.reshape([0, 6])
+        self.assertTrue(list(zero_tensor.shape) == [0, 6])
+
+    def test_reshape_zero_tensor_error(self):
+        zero_tensor = paddle.zeros([0, 2, 3])
+        with self.assertRaises(ValueError):
+            zero_tensor.reshape([2, 3])
+
+
 if __name__ == "__main__":
+    paddle.enable_static()
     unittest.main()

@@ -52,11 +52,6 @@ class ActivationOpConverter : public OpConverter {
         engine_->GetITensor(op_desc.Input("X")[0]);
 
     auto op_pair = ops.find(op_type_);
-    if (op_pair == ops.end()) {
-      PADDLE_THROW(platform::errors::Fatal(
-          "Wrong activation op type, the trt do not support the %s act type.",
-          op_type_));
-    }
 
     nvinfer1::IActivationLayer* layer = TRT_ENGINE_ADD_LAYER(
         engine_, Activation, *const_cast<nvinfer1::ITensor*>(input_tensor),
@@ -73,12 +68,6 @@ class ActivationOpConverter : public OpConverter {
     auto output_name = op_desc.Output("Out")[0];
 
     RreplenishLayerAndOutput(layer, op_type_, {output_name}, test_mode);
-    if (op_desc.HasAttr("out_scale")) {
-#if IS_TRT_VERSION_GE(5130)
-      float out_scale = BOOST_GET_CONST(float, op_desc.GetAttr("out_scale"));
-      engine_->SetTensorDynamicRange(layer->getOutput(0), out_scale);
-#endif
-    }
   }
 
  protected:

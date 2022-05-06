@@ -30,6 +30,7 @@ from paddle.fluid import compiler
 from paddle.fluid import Program, program_guard
 
 from op_test import OpTest, _set_use_system_allocator
+from decorator_helper import prog_scope
 
 _set_use_system_allocator(True)
 
@@ -105,6 +106,7 @@ class TestSyncBatchNormOpTraining(unittest.TestCase):
                     sgd_opt.backward(out)
         return main, startup, [out, conv, bn]
 
+    @prog_scope()
     def _compare(self, place, layout, only_forward):
         """Compare results."""
         seed = 10
@@ -248,7 +250,7 @@ class TestConvertSyncBatchNorm(unittest.TestCase):
                         isinstance(model[idx], paddle.nn.SyncBatchNorm), True)
 
 
-class TestConvertSyncBatchNormCase2(unittest.TestCase):
+class TestConvertSyncBatchNormCast1(unittest.TestCase):
     def test_convert(self):
         if not core.is_compiled_with_cuda():
             return
@@ -275,6 +277,71 @@ class TestConvertSyncBatchNormCase2(unittest.TestCase):
         compare_model.add_sublayer('net2', Net())
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         self.assertEqual(len(compare_model.sublayers()), len(model.sublayers()))
+
+
+class TestConvertSyncBatchNormCase2(unittest.TestCase):
+    def test_convert(self):
+        if not core.is_compiled_with_cuda():
+            return
+
+        with fluid.dygraph.guard(fluid.CUDAPlace(0)):
+
+            class SyBNNet(paddle.nn.Layer):
+                def __init__(self, in_ch=3, out_ch=3, dirate=1):
+                    super(SyBNNet, self).__init__()
+                    self.bn_s1 = paddle.nn.SyncBatchNorm.convert_sync_batchnorm(
+                        paddle.nn.BatchNorm3D(
+                            out_ch,
+                            weight_attr=paddle.ParamAttr(
+                                regularizer=paddle.regularizer.L2Decay(0.))))
+                    self.bn_s2 = paddle.nn.SyncBatchNorm.convert_sync_batchnorm(
+                        paddle.nn.BatchNorm3D(
+                            out_ch, data_format='NDHWC'))
+
+                def forward(self, x):
+                    x = self.bn_s1(x)
+                    out = paddle.sum(paddle.abs(self.bn_s2(x)))
+                    return out
+
+            class BNNet(paddle.nn.Layer):
+                def __init__(self, in_ch=3, out_ch=3, dirate=1):
+                    super(BNNet, self).__init__()
+                    self.bn_s1 = paddle.nn.BatchNorm3D(
+                        out_ch,
+                        weight_attr=paddle.ParamAttr(
+                            regularizer=paddle.regularizer.L2Decay(0.)))
+                    self.bn_s2 = paddle.nn.SyncBatchNorm.convert_sync_batchnorm(
+                        paddle.nn.BatchNorm3D(
+                            out_ch, data_format='NDHWC'))
+
+                def forward(self, x):
+                    x = self.bn_s1(x)
+                    out = paddle.sum(paddle.abs(self.bn_s2(x)))
+                    return out
+
+            bn_model = BNNet()
+            sybn_model = SyBNNet()
+            np.random.seed(10)
+            data = np.random.random([3, 3, 3, 3, 3]).astype('float32')
+            x = paddle.to_tensor(data)
+            bn_out = bn_model(x)
+            sybn_out = sybn_model(x)
+            self.assertTrue(
+                np.allclose(bn_out.numpy(), sybn_out.numpy()),
+                "Output has diff. \n" + "\nBN     " + str(bn_out.numpy()) + "\n"
+                + "Sync BN " + str(sybn_out.numpy()))
+
+
+class TestDygraphSyncBatchNormDataFormatError(unittest.TestCase):
+    def test_errors(self):
+        if not core.is_compiled_with_cuda():
+            return
+
+        with fluid.dygraph.guard(fluid.CUDAPlace(0)):
+            my_sync_batch_norm = paddle.nn.SyncBatchNorm(10, data_format='CN')
+            data = np.random.random([3, 3, 3]).astype('float32')
+            x = paddle.to_tensor(data)
+            self.assertRaises(ValueError, my_sync_batch_norm, x)
 
 
 if __name__ == '__main__':

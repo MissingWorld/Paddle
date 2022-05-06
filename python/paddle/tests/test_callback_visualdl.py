@@ -29,6 +29,7 @@ import paddle.vision.transforms as T
 from paddle.vision.datasets import MNIST
 from paddle.metric import Accuracy
 from paddle.nn.layer.loss import CrossEntropyLoss
+from paddle.fluid.framework import _test_eager_guard, _in_legacy_dygraph
 
 
 class MnistDataset(MNIST):
@@ -43,7 +44,7 @@ class TestCallbacks(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.save_dir)
 
-    def test_visualdl_callback(self):
+    def func_visualdl_callback(self):
         # visualdl not support python2
         if sys.version_info < (3, ):
             return
@@ -55,7 +56,7 @@ class TestCallbacks(unittest.TestCase):
         train_dataset = MnistDataset(mode='train', transform=transform)
         eval_dataset = MnistDataset(mode='test', transform=transform)
 
-        net = paddle.vision.LeNet()
+        net = paddle.vision.models.LeNet()
         model = paddle.Model(net, inputs, labels)
 
         optim = paddle.optimizer.Adam(0.001, parameters=net.parameters())
@@ -69,6 +70,11 @@ class TestCallbacks(unittest.TestCase):
                   eval_dataset,
                   batch_size=64,
                   callbacks=callback)
+
+    def test_visualdl_callback(self):
+        with _test_eager_guard():
+            self.func_visualdl_callback()
+        self.func_visualdl_callback()
 
 
 if __name__ == '__main__':

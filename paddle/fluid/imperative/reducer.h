@@ -29,15 +29,10 @@
 #include "paddle/fluid/framework/tensor.h"
 #include "paddle/fluid/framework/tensor_util.h"
 #include "paddle/fluid/framework/variable.h"
-#include "paddle/fluid/operators/math/math_function.h"
 #include "paddle/fluid/platform/for_range.h"
+#include "paddle/phi/kernels/funcs/math_function.h"
 
 namespace paddle {
-namespace platform {
-class DeviceContext;
-
-}  // namespace platform
-
 namespace imperative {
 class ParallelContext;
 class VarBase;
@@ -48,8 +43,9 @@ class VariableWrapper;
 namespace paddle {
 namespace imperative {
 
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL) || \
-    defined(PADDLE_WITH_XPU_BKCL)
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL) ||     \
+    defined(PADDLE_WITH_XPU_BKCL) || defined(PADDLE_WITH_GLOO) || \
+    defined(PADDLE_WITH_ASCEND_CL) || defined(PADDLE_WITH_CNCL)
 
 template <typename T>
 struct DivNRanksFunctor {
@@ -162,12 +158,15 @@ class Reducer {
   std::vector<std::vector<size_t>> RebuildGruops();
 
   inline bool NeedRebuildGroup() {
-    return !has_rebuilt_group_ && !find_unused_vars_;
+    return !has_rebuilt_group_ && !find_unused_vars_each_step_;
   }
 
   void ProcessUnusedDenseVars();
 
   bool HasGrad(size_t var_index);
+
+  void TraverseBackwardGraph(
+      const std::vector<std::shared_ptr<imperative::VarBase>>& outputs);
 
  private:
   std::vector<std::shared_ptr<imperative::VarBase>> vars_;
@@ -195,7 +194,8 @@ class Reducer {
   std::unordered_map<VariableWrapper*, size_t> var_index_map_;
   std::vector<size_t> unused_vars_;
   bool has_marked_unused_vars_{false};
-  bool find_unused_vars_{false};
+  bool find_unused_vars_each_step_{false};
+  bool find_unused_vars_once_{true};
   bool groups_need_finalize_{false};
 #ifdef PADDLE_WITH_XPU_BKCL
   // comm_pool_ is used for scheduling allreduce in multi Kunlun cards training.
@@ -204,6 +204,12 @@ class Reducer {
   std::mutex mutex_;
   std::condition_variable cv_;
 #endif
+
+  // grad_need_hooks_ is used to mark whether gradient synchronization is
+  // required across process. The default value is false. When backward()
+  // is called, grad_need_hooks_ will be assigned to true during preparation
+  // of backward and revert to false while finalizing backward.
+  bool grad_need_hooks_{false};
 
   // it just for checking hook, each parameter can only trigger one hook
   std::vector<bool> vars_marked_ready_;

@@ -33,12 +33,10 @@ if (WITH_LITE)
   add_subdirectory(lite)
 endif()
 
-# fluid_modules exclude API-interface of inference/api and inference/capi
+# fluid_modules exclude API-interface of inference/api and inference/capi_exp
 get_property(fluid_modules GLOBAL PROPERTY FLUID_MODULES)
-
-# Adapt to custom op mechanism: Include the header files related to the data type
-# to avoid exposing the path of the underlying file
-include_directories(${PADDLE_SOURCE_DIR}/paddle/fluid/platform)
+get_property(phi_modules GLOBAL PROPERTY PHI_MODULES)
+set(utils_modules stringpiece pretty_log string_helper benchmark)
 
 add_subdirectory(api)
 
@@ -47,11 +45,12 @@ add_subdirectory(api)
 set(STATIC_INFERENCE_API paddle_inference_api analysis_predictor
      zero_copy_tensor reset_tensor_array
         analysis_config paddle_pass_builder activation_functions ${mkldnn_quantizer_cfg})
-#TODO(wilber, T8T9): Do we still need to support windows gpu static library?
+
+#windows GPU static library over the limit, so not create_static_lib, and cc_library is dummy
 if(WIN32 AND WITH_GPU)
-  cc_library(paddle_inference DEPS ${fluid_modules} ${STATIC_INFERENCE_API})
+  cc_library(paddle_inference DEPS ${fluid_modules} phi ${STATIC_INFERENCE_API} ${utils_modules})
 else()
-  create_static_lib(paddle_inference ${fluid_modules} ${STATIC_INFERENCE_API})
+  create_static_lib(paddle_inference ${fluid_modules} ${phi_modules} ${STATIC_INFERENCE_API} ${utils_modules})
 endif()
 
 if(NOT APPLE)
@@ -61,7 +60,7 @@ if(NOT APPLE)
 endif()
 
 # C inference API
-add_subdirectory(capi)
+add_subdirectory(capi_exp)
 
 if(WITH_TESTING AND WITH_INFERENCE_API_TEST)
     add_subdirectory(tests/api)
@@ -75,21 +74,27 @@ set(SHARED_INFERENCE_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/api/api.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/api/api_impl.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/api/analysis_predictor.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/api/paddle_infer_contrib.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/api/details/zero_copy_tensor.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/utils/io_utils.cc
-    ${mkldnn_quantizer_src_file}
     ${PADDLE_CUSTOM_OP_SRCS})
 
 # shared inference library deps
-set(SHARED_INFERENCE_DEPS ${fluid_modules} analysis_predictor)
+set(SHARED_INFERENCE_DEPS ${fluid_modules} phi analysis_predictor ${utils_modules})
 
 if (WITH_CRYPTO) 
     set(SHARED_INFERENCE_DEPS ${SHARED_INFERENCE_DEPS} paddle_crypto)
 endif (WITH_CRYPTO)
 
 if (WITH_PSCORE)
-    set(SHARED_INFERENCE_DEPS ${SHARED_INFERENCE_DEPS} fleet ps_service)
+    set(SHARED_INFERENCE_DEPS ${SHARED_INFERENCE_DEPS} fleet ps_service tensor_table)
 endif ()
+
+if (WITH_ONNXRUNTIME)
+  set(SHARED_INFERENCE_SRCS ${SHARED_INFERENCE_SRCS} 
+      ${CMAKE_CURRENT_SOURCE_DIR}/api/onnxruntime_predictor.cc
+  )
+endif (WITH_ONNXRUNTIME)
 
 # Create shared inference library
 cc_library(paddle_inference_shared SHARED SRCS ${SHARED_INFERENCE_SRCS}
@@ -118,9 +123,4 @@ if(NOT APPLE AND NOT WIN32)
     COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_BINARY_DIR}/check_symbol.cmake"
     DEPENDS paddle_inference_shared)
   add_custom_target(check_symbol ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/.check_symbol")
-endif()
-
-if(LINUX AND WITH_STRIP)
-  add_custom_command(TARGET paddle_inference_shared POST_BUILD
-    COMMAND ${STRIP_PATH} $<TARGET_FILE:paddle_inference_shared>)
 endif()

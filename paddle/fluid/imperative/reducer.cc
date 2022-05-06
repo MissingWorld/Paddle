@@ -16,6 +16,7 @@
 
 #include <iostream>
 
+#include "paddle/fluid/framework/tensor_util.h"
 #include "paddle/fluid/imperative/layer.h"
 #include "paddle/fluid/string/string_helper.h"
 
@@ -24,31 +25,51 @@
 
 #include "paddle/fluid/imperative/parallel_context.h"
 
+#include "paddle/phi/core/dense_tensor.h"
 namespace paddle {
 namespace imperative {
 
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL) || \
-    defined(PADDLE_WITH_XPU_BKCL)
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL) ||     \
+    defined(PADDLE_WITH_XPU_BKCL) || defined(PADDLE_WITH_GLOO) || \
+    defined(PADDLE_WITH_ASCEND_CL) || defined(PADDLE_WITH_CNCL)
 // div the nranks
 void Group::DivNRanks(const platform::DeviceContext &context, int64_t nranks) {
   framework::Tensor *tensor =
       is_sparse_
-          ? sparse_contents_->GetMutable<framework::SelectedRows>()
-                ->mutable_value()
+          ? sparse_contents_->GetMutable<phi::SelectedRows>()->mutable_value()
           : dense_contents_.GetMutable<framework::LoDTensor>();
 
   if (platform::is_gpu_place(tensor->place())) {
 #if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
     DivNRanks(tensor, nranks, context);
 #endif
+  } else if (platform::is_npu_place(tensor->place())) {
+    // TODO(kuizhiqing)
+    VLOG(4) << "divnrank for npu not support yet";
   } else if (platform::is_cpu_place(tensor->place())) {
-    framework::VisitDataTypeSmall(
+    VLOG(4) << "before div 2" << *tensor;
+    VLOG(4) << "NDiv for cpu devices : rank = " << nranks;
+#ifdef PADDLE_WITH_HIP
+    if (dtype_ == paddle::framework::proto::VarType_Type_BF16) {
+      PADDLE_THROW(paddle::platform::errors::Fatal(
+          "Unsupport BF16 in DataParallel for now"));
+    }
+    framework::VisitDataTypeForHIP(
         dtype_, DivNRanksForAllReduce<platform::CPUDeviceContext>(
                     tensor, nranks, context));
+#else
+    framework::VisitDataType(dtype_,
+                             DivNRanksForAllReduce<platform::CPUDeviceContext>(
+                                 tensor, nranks, context));
+#endif
+    VLOG(4) << "after div 2" << *tensor;
   } else if (platform::is_xpu_place(tensor->place())) {
 #ifdef PADDLE_WITH_XPU_BKCL
 // TODO(liuyuhui) support xpu about div nranks in the future
 #endif
+  } else if (platform::is_mlu_place(tensor->place())) {
+    // TODO(zhangna)
+    VLOG(4) << "divnrank for mlu not support yet";
   }
 }
 
@@ -204,6 +225,56 @@ void SplitTensorsWithType<platform::XPUDeviceContext>(
 }
 #endif
 
+#ifdef PADDLE_WITH_CNCL
+// context is used to select the stream for concat
+template <>
+void ConcatTensorsWithType<platform::MLUDeviceContext>(
+    const platform::MLUDeviceContext &context,
+    const std::vector<framework::Tensor> &dense_tensors_,
+    framework::Variable *p_dense_contents,
+    framework::proto::VarType::Type type) {
+  switch (type) {
+    case framework::proto::VarType::FP16:
+      ConcatTensorsForAllReduce<platform::MLUDeviceContext, platform::float16>(
+          context, dense_tensors_, p_dense_contents);
+      break;
+    case framework::proto::VarType::FP32:
+      ConcatTensorsForAllReduce<platform::MLUDeviceContext, float>(
+          context, dense_tensors_, p_dense_contents);
+      break;
+    default:
+      PADDLE_THROW(platform::errors::Unimplemented(
+          "Data type (%s) is not supported when it concats tensors for "
+          "allreduce.",
+          framework::DataTypeToString(type)));
+  }
+}
+
+// context is used to select the stream for split
+template <>
+void SplitTensorsWithType<platform::MLUDeviceContext>(
+    const platform::MLUDeviceContext &context,
+    framework::Variable *p_dense_contents,
+    std::vector<framework::Tensor> *p_dense_tensors,
+    framework::proto::VarType::Type type) {
+  switch (type) {
+    case framework::proto::VarType::FP16:
+      SplitTensorsForAllReduce<platform::MLUDeviceContext, platform::float16>(
+          context, p_dense_contents, p_dense_tensors);
+      break;
+    case framework::proto::VarType::FP32:
+      SplitTensorsForAllReduce<platform::MLUDeviceContext, float>(
+          context, p_dense_contents, p_dense_tensors);
+      break;
+    default:
+      PADDLE_THROW(platform::errors::Unimplemented(
+          "Data type (%s) is not supported when it splits tensors for "
+          "allreduce.",
+          framework::DataTypeToString(type)));
+  }
+}
+#endif
+
 void Group::ConcatTensors(const platform::DeviceContext &context) {
   auto place = context.GetPlace();
   if (platform::is_gpu_place(place)) {
@@ -225,6 +296,26 @@ void Group::ConcatTensors(const platform::DeviceContext &context) {
     PADDLE_THROW(platform::errors::PermissionDenied(
         "Paddle can't concat xpu grads since it's not compiled with BKCL,"
         "Please recompile or reinstall Paddle with BKCL support."));
+#endif
+  } else if (platform::is_npu_place(place)) {
+#ifdef PADDLE_WITH_ASCEND_CL
+    ConcatTensorsWithType(
+        static_cast<const platform::NPUDeviceContext &>(context),
+        dense_tensors_, &dense_contents_, dtype_);
+#else
+    PADDLE_THROW(platform::errors::PermissionDenied(
+        "Paddle can't concat npu grads since it's not compiled with HCCL,"
+        "Please recompile or reinstall Paddle with HCCL support."));
+#endif
+  } else if (platform::is_mlu_place(place)) {
+#ifdef PADDLE_WITH_CNCL
+    ConcatTensorsWithType(
+        static_cast<const platform::MLUDeviceContext &>(context),
+        dense_tensors_, &dense_contents_, dtype_);
+#else
+    PADDLE_THROW(platform::errors::PermissionDenied(
+        "Paddle can't concat mlu grads since it's not compiled with CNCL,"
+        "Please recompile or reinstall Paddle with CNCL support."));
 #endif
   } else if (platform::is_cpu_place(place)) {
     ConcatTensorsWithType(
@@ -257,6 +348,26 @@ void Group::SplitTensors(const platform::DeviceContext &context) {
     PADDLE_THROW(platform::errors::PermissionDenied(
         "Paddle can't split xpu grad since it's not compiled with BKCL,"
         "Please recompile or reinstall Paddle with BKCL support."));
+#endif
+  } else if (platform::is_npu_place(place)) {
+#ifdef PADDLE_WITH_ASCEND_CL
+    SplitTensorsWithType(
+        static_cast<const platform::NPUDeviceContext &>(context),
+        &dense_contents_, &dense_tensors_, dtype_);
+#else
+    PADDLE_THROW(platform::errors::PermissionDenied(
+        "Paddle can't split npu grad since it's not compiled with HCCL,"
+        "Please recompile or reinstall Paddle with HCCL support."));
+#endif
+  } else if (platform::is_mlu_place(place)) {
+#ifdef PADDLE_WITH_CNCL
+    SplitTensorsWithType(
+        static_cast<const platform::MLUDeviceContext &>(context),
+        &dense_contents_, &dense_tensors_, dtype_);
+#else
+    PADDLE_THROW(platform::errors::PermissionDenied(
+        "Paddle can't split mlu grad since it's not compiled with CNCL,"
+        "Please recompile or reinstall Paddle with CNCL support."));
 #endif
   } else if (platform::is_cpu_place(place)) {
     SplitTensorsWithType(
@@ -297,7 +408,7 @@ Reducer::Reducer(const std::vector<std::shared_ptr<imperative::VarBase>> &vars,
       is_sparse_gradient_(is_sparse_gradient),
       parallel_ctx_(parallel_ctx),
       group_size_limits_(group_size_limits),
-      find_unused_vars_(find_unused_vars) {
+      find_unused_vars_each_step_(find_unused_vars) {
   VLOG(3) << "Start construct the Reducer ...";
   nrings_ = parallel_ctx->GetNRings();
   nranks_ = parallel_ctx->GetNRanks();
@@ -407,8 +518,8 @@ void Reducer::InitializeGroups(
       // process the dense gradient.
       InitializeDenseGroups(variable_indices_, &group);
       auto tensor = group.dense_contents_.GetMutable<framework::LoDTensor>();
-      tensor->Resize(framework::make_ddim({group.all_length_}))
-          .mutable_data(place_, group.dtype_);
+      tensor->Resize(phi::make_ddim({group.all_length_}))
+          .mutable_data(place_, framework::TransToPhiDataType(group.dtype_));
     }
 
     // map variables to this group by VariableLocator
@@ -443,15 +554,26 @@ void Reducer::PrepareDeps(const std::unordered_set<GradOpNode *> &init_nodes) {
     auto *cur_node = q.front();
     q.pop();
 
-    for (auto &cur_op : *cur_node) {
-      cur_op.EnforceHasInOut();
-    }
-
     const auto &grad_pending_nodes = cur_node->GradPendingNodes();
     for (auto &grad_pending_node : grad_pending_nodes) {
       PADDLE_ENFORCE_NOT_NULL(
           grad_pending_node,
           platform::errors::NotFound("Grad pending node should not be null"));
+      // py_layer is not supported in DataParallel
+      auto begin = grad_pending_node->begin();
+      auto end = grad_pending_node->end();
+      for (auto op_base = begin; op_base != end; op_base++) {
+        PADDLE_ENFORCE_EQ(
+            op_base->Type() != "py_layer", true,
+            platform::errors::PreconditionNotMet(
+                "Note: Currently PyLayer is not supported in DataParallel. For "
+                "using PyLayer in a DataParallel model, you can skip gradient "
+                "synchronization among multiple cards by 'no_sync', and "
+                "manually implement 'all_reduce' before model optimization. "
+                "There is an example showing specific implemetation processing "
+                "in offical docs: https://www.paddlepaddle.org.cn/documentation"
+                "/docs/api/paddle/DataParallel_cn.html"));
+      }
       ++node_deps_[grad_pending_node.get()];
       if (visited.count(grad_pending_node.get()) == 0) {
         visited.insert(grad_pending_node.get());
@@ -461,42 +583,8 @@ void Reducer::PrepareDeps(const std::unordered_set<GradOpNode *> &init_nodes) {
   }
 }
 
-// After each batch is calculated, the counter of each group(group.pending_)
-// and allreudce sequence counter(next_group_) will be cleaned up again.
-void Reducer::PrepareForBackward(
+void Reducer::TraverseBackwardGraph(
     const std::vector<std::shared_ptr<imperative::VarBase>> &outputs) {
-  VLOG(3) << "after forward, then reset count for backward.";
-  next_group_ = 0;
-  std::for_each(groups_.begin(), groups_.end(), [](Group &group) {
-    group.pending_ = group.variable_indices_.size();
-    group.sparse_contents_ = nullptr;
-  });
-
-  // reinitialize vars_marked_ready_ for next iteration
-  vars_marked_ready_.clear();
-  vars_marked_ready_.resize(vars_.size(), false);
-
-  PADDLE_ENFORCE_EQ(
-      groups_need_finalize_, false,
-      platform::errors::PreconditionNotMet(
-          "A serious error has occurred here. There may be several reasons: "
-          "1) Please note that all forward outputs derived from the module "
-          "parameters must participate in the calculation of losses and "
-          "subsequent gradient calculations. If not, the wrapper will hang, "
-          "waiting for autograd to generate gradients for these parameters. "
-          "you can use detach or stop_gradient to make the unused parameters "
-          "detached from the autograd graph. "
-          "2) Used multiple forwards and one backward. You may be able to wrap "
-          "multiple forwards in a model."));
-
-  // The first var to trigger the unused parameter
-  has_marked_unused_vars_ = false;
-  unused_vars_.clear();
-
-  if (!find_unused_vars_) {
-    return;
-  }
-
   node_deps_.clear();
   std::queue<std::shared_ptr<GradOpNode>> q;
   std::unordered_set<VariableWrapper *> var_visited;
@@ -523,7 +611,6 @@ void Reducer::PrepareForBackward(
     q.pop();
 
     for (const auto &cur_op : *cur_node) {
-      cur_op.EnforceHasInOut();
       auto &bwd_outs = cur_op.GetOutsMap();
       for (const auto &pair : bwd_outs) {
         if (!pair.second.IsGrad()) {
@@ -559,8 +646,51 @@ void Reducer::PrepareForBackward(
               << "] is not used";
     }
   }
+}
 
-  if (unused_vars_.empty()) {
+// After each batch is calculated, the counter of each group(group.pending_)
+// and allreudce sequence counter(next_group_) will be cleaned up again.
+void Reducer::PrepareForBackward(
+    const std::vector<std::shared_ptr<imperative::VarBase>> &outputs) {
+  VLOG(3) << "after forward, then reset count for backward.";
+  grad_need_hooks_ = true;
+  next_group_ = 0;
+  std::for_each(groups_.begin(), groups_.end(), [](Group &group) {
+    group.pending_ = group.variable_indices_.size();
+    group.sparse_contents_ = nullptr;
+  });
+
+  // reinitialize vars_marked_ready_ for next iteration
+  vars_marked_ready_.clear();
+  vars_marked_ready_.resize(vars_.size(), false);
+
+  PADDLE_ENFORCE_EQ(
+      groups_need_finalize_, false,
+      platform::errors::PreconditionNotMet(
+          "A serious error has occurred here. Please "
+          "set find_unused_parameters=True to traverse backward graph "
+          "in each step to prepare reduce in advance. If you have "
+          "set, There may be several reasons for this error: "
+          "1) Please note that all forward outputs derived from the module "
+          "parameters must participate in the calculation of losses and "
+          "subsequent gradient calculations. If not, the wrapper will hang, "
+          "waiting for autograd to generate gradients for these parameters. "
+          "you can use detach or stop_gradient to make the unused parameters "
+          "detached from the autograd graph. "
+          "2) Used multiple forwards and one backward. You may be able to wrap "
+          "multiple forwards in a model."));
+
+  // The first var to trigger the unused parameter
+  has_marked_unused_vars_ = false;
+
+  if (find_unused_vars_once_ || find_unused_vars_each_step_) {
+    unused_vars_.clear();
+    TraverseBackwardGraph(outputs);
+    // only check once in first step
+    find_unused_vars_once_ = false;
+  }
+
+  if (find_unused_vars_each_step_ && unused_vars_.empty()) {
     LOG_FIRST_N(WARNING, 1)
         << "All parameters are involved in the backward pass. "
            "It is recommended to set find_unused_parameters to False "
@@ -569,7 +699,9 @@ void Reducer::PrepareForBackward(
            "will occur. Please make it clear that in the subsequent "
            "training, there will be no parameters that are not used "
            "in the backward pass, and then set find_unused_parameters";
-  } else if (unused_vars_.size() == vars_.size()) {
+  }
+
+  if (unused_vars_.size() == vars_.size()) {
     LOG_FIRST_N(WARNING, 1)
         << "There is no parameter in the device involved "
            "in the backward calculation. If there are "
@@ -594,19 +726,24 @@ void Reducer::AddDistHook(size_t var_index) {
                         "than %d, but it is %d",
                         variable_locators_.size(), var_index));
 
+  // gradient synchronization is not required when grad_need_hooks_ is false.
+  if (!grad_need_hooks_) {
+    return;
+  }
+
   VLOG(3) << "Var[" << var_index << "] ["
           << vars_[var_index]->GradVarBase()->Name()
           << "] arrived and triggered disthook";
 
   local_used_vars_[var_index] = 1;
 
-  // rebuild group when find_unused_vars_ is false
+  // rebuild group when find_unused_vars_each_step_ is false
   if (NeedRebuildGroup()) {
     rebuild_vars_.push_back(vars_[var_index]);
     rebuild_var_indices_.push_back(var_index);
   }
 
-  if (!has_marked_unused_vars_ && find_unused_vars_) {
+  if (!has_marked_unused_vars_) {
     has_marked_unused_vars_ = true;
     for (const auto &unused_index : unused_vars_) {
       MarkVarReady(unused_index, false);
@@ -627,7 +764,9 @@ void Reducer::MarkVarReady(const size_t var_index, const bool is_used_var) {
   if (vars_marked_ready_[var_index]) {
     auto error_info = string::Sprintf(
         "Error happened, when parameter[%d][%s] has been ready before. "
-        "There may be several reasons for this error: "
+        "Please set find_unused_parameters=True to traverse backward graph "
+        "in each step to prepare reduce in advance. If you have set, "
+        "there may be several reasons for this error: "
         "1) In multiple reentrant backward phase, some parameters are reused."
         "2) Using model parameters outside of forward function. Please "
         "make sure that model parameters are not shared in concurrent "
@@ -671,7 +810,8 @@ void Reducer::MarkVarReady(const size_t var_index, const bool is_used_var) {
       // by avoiding tensor construction
       if (!group_tensor.IsInitialized()) {
         group_tensor.Resize({static_cast<int64_t>(length)});
-        group_tensor.mutable_data(place_, group.dtype_);
+        group_tensor.mutable_data(place_,
+                                  framework::TransToPhiDataType(group.dtype_));
       }
 
 #ifdef PADDLE_WITH_XPU_BKCL
@@ -679,30 +819,41 @@ void Reducer::MarkVarReady(const size_t var_index, const bool is_used_var) {
         // TODO(liuyuhui) support XPU set constant
         VLOG(3) << "XPU doesn't support set_constant";
       }
+#elif defined(PADDLE_WITH_CNCL)
+      if (platform::is_mlu_place(group_tensor.place())) {
+        // TODO(liuyuhui) support MLU set constant
+        VLOG(3) << "MLU doesn't support set_constant";
+      }
 #else
       auto *dev_ctx = platform::DeviceContextPool::Instance().Get(place_);
       if (HasGrad(var_index)) {
         auto var_base = vars_[var_index]->GradVarBase();
         auto tensor =
             var_base->MutableVar()->GetMutable<framework::LoDTensor>();
-        TensorCopy(*tensor, place_, *dev_ctx, &group_tensor);
-        group_tensor.Resize({static_cast<int64_t>(length)});
+        group_tensor.ShareDataWith(*tensor).Resize(
+            {static_cast<int64_t>(length)});
       } else {
         group_tensor.Resize({static_cast<int64_t>(length)});
-        operators::math::set_constant(*dev_ctx, &group_tensor, 0.0);
+        phi::funcs::set_constant(*dev_ctx, &group_tensor, 0.0);
       }
 #endif
     }
   } else {
     // process sparse group
-    PADDLE_ENFORCE_EQ(HasGrad(var_index), true,
-                      platform::errors::PreconditionNotMet(
-                          "The sparse parameter[%d][%s] must have a gradient",
-                          var_index, vars_[var_index]->Name()));
+    PADDLE_ENFORCE_EQ(
+        HasGrad(var_index), true,
+        platform::errors::PreconditionNotMet(
+            "The sparse parameter[%d][%s] should have gradient. "
+            "Currently, DataParallel does not support sparse "
+            "parameters without generating gradients during training. "
+            "For example, if is_sparese=True is used in Embedding, "
+            "the current step of this parameter cannot generate gradient "
+            "because of stop_gradient/detatch, where error will occur.",
+            var_index, vars_[var_index]->Name()));
     auto var_base = vars_[var_index]->GradVarBase();
     // need to check tensor type
     PADDLE_ENFORCE_EQ(
-        var_base->Var().IsType<framework::SelectedRows>(), true,
+        var_base->Var().IsType<phi::SelectedRows>(), true,
         platform::errors::PreconditionNotMet(
             "The sparse parameter[%d][%s] must have a selectedrows gradient. "
             "Before forward pass, the parameter type is inferred to be "
@@ -745,8 +896,8 @@ void Reducer::MarkGroupReady(size_t group_index) {
 
   for (; next_group_ < groups_.size() && groups_[next_group_].pending_ == 0;
        ++next_group_) {
-    auto &group = groups_[next_group_];
-    const int run_order = next_group_ % nrings_;
+    UNUSED auto &group = groups_[next_group_];
+    UNUSED const int run_order = next_group_ % nrings_;
 
     // For CUDA or XPU, compute_stream --> comm_stream.
     // For CPU, do nothing.
@@ -762,21 +913,24 @@ void Reducer::MarkGroupReady(size_t group_index) {
     // TODO(liuyuhui): Add try catch to deal with exception later,
     // otherwise the main thread will continue to run when an exception is
     // thrown in comm_pool_.
-    comm_pool_->enqueue([&] {
-      auto dev_id = BOOST_GET_CONST(platform::XPUPlace, place_).device;
+    auto next_group = next_group_;
+    comm_pool_->enqueue([this, run_order, next_group, &group] {
+      auto dev_id = place_.device;
       platform::SetXPUDeviceId(dev_id);
-      FusedAllReduceSchedule(run_order, group, next_group_);
+      FusedAllReduceSchedule(run_order, group, next_group);
       {
         std::lock_guard<std::mutex> lock(mutex_);
         comm_op_count_ -= 1;  // lock
         cv_.notify_all();
       }
     });
-#elif defined(PADDLE_WITH_RCCL) || defined(PADDLE_WITH_NCCL)
+#elif defined(PADDLE_WITH_RCCL) || defined(PADDLE_WITH_NCCL) ||    \
+    defined(PADDLE_WITH_GLOO) || defined(PADDLE_WITH_ASCEND_CL) || \
+    defined(PADDLE_WITH_CNCL)
     FusedAllReduceSchedule(run_order, group, next_group_);
 #else
     PADDLE_THROW(platform::errors::PreconditionNotMet(
-        "Not compiled with BKCL or NCCL."));
+        "Not compiled with BKCL or NCCL or CNCL or GLOO."));
 #endif
   }
 }
@@ -893,12 +1047,17 @@ void Reducer::ProcessUnusedDenseVars() {
 
       // 3. create grad var base or get grad var base
       auto grad_var_base_tmp = dest_var_base->MutableGradVarBase();
+      // NOTE(haohongxiang): Calling SetIsEmpty here is to make sure that
+      // gradient accumulation can continue normally after clear_gradients()
+      // especiall in cases including complex control flow.
+      grad_var_base_tmp->SharedVar()->SetIsEmpty(false);
 
       // 4. set grad tensor
       auto *dest_grad_tensor =
           grad_var_base_tmp->MutableVar()->GetMutable<framework::LoDTensor>();
       const auto *dev_ctx = platform::DeviceContextPool::Instance().Get(place_);
-      TensorCopy(src_tensor, place_, *dev_ctx, dest_grad_tensor);
+      paddle::framework::TensorCopy(src_tensor, place_, *dev_ctx,
+                                    dest_grad_tensor);
       dest_grad_tensor->Resize(dest_dims);
     }
   }
@@ -915,8 +1074,8 @@ bool Reducer::HasGrad(size_t var_index) {
     if (var.Get<framework::LoDTensor>().IsInitialized()) {
       return true;
     }
-  } else if (var.IsType<framework::SelectedRows>()) {
-    if (var.Get<framework::SelectedRows>().value().IsInitialized()) {
+  } else if (var.IsType<phi::SelectedRows>()) {
+    if (var.Get<phi::SelectedRows>().value().IsInitialized()) {
       return true;
     }
   } else {
@@ -928,6 +1087,7 @@ bool Reducer::HasGrad(size_t var_index) {
 
 void Reducer::FinalizeBackward() {
   groups_need_finalize_ = false;
+  grad_need_hooks_ = false;
 #ifdef PADDLE_WITH_XPU_BKCL
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -947,9 +1107,11 @@ void Reducer::FinalizeBackward() {
     InitializeGroups(group_indices_);
   }
 
-  if (find_unused_vars_) {
+  if (find_unused_vars_each_step_) {
 // TODO(liuyuhui) support xpu about Tensorcopy/TensorFromVector/TensorToVector
-#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL) ||      \
+    defined(PADDLE_WITH_GLOO) || defined(PADDLE_WITH_ASCEND_CL) || \
+    defined(PADDLE_WITH_CNCL)
     ProcessUnusedDenseVars();
 #endif
     // Initialize local used vars

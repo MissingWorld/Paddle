@@ -12,8 +12,9 @@ limitations under the License. */
 #include <memory>
 #include <string>
 
-#include "paddle/fluid/operators/npu_op_runner.h"
-#include "paddle/fluid/operators/softmax_op.h"
+#include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/platform/device/npu/npu_op_runner.h"
+#include "paddle/phi/kernels/funcs/axis_utils.h"
 
 namespace paddle {
 namespace operators {
@@ -31,7 +32,7 @@ class SoftmaxNPUKernel : public framework::OpKernel<T> {
     auto* out = ctx.Output<framework::LoDTensor>("Out");
     out->mutable_data<T>(ctx.GetPlace());
 
-    auto runner = NpuOpRunner("SoftmaxV2", {*in}, {*out}, attr_input);
+    const auto& runner = NpuOpRunner("SoftmaxV2", {*in}, {*out}, attr_input);
 
     auto stream =
         ctx.template device_context<paddle::platform::NPUDeviceContext>()
@@ -51,7 +52,7 @@ class SoftmaxGradNPUKernel : public framework::OpKernel<T> {
 
     auto dims = dX->dims();
     const int rank = dims.size();
-    const int axis = CanonicalAxis(ctx.Attr<int>("axis"), rank);
+    const int axis = phi::funcs::CanonicalAxis(ctx.Attr<int>("axis"), rank);
     int64_t first_dim = 1;
     int64_t sec_dim = 1;
     for (int i = 0; i < axis; i++) {
@@ -67,12 +68,12 @@ class SoftmaxGradNPUKernel : public framework::OpKernel<T> {
     Tensor tmp_dOut;
     tmp_dOut.ShareDataWith(*dOut).Resize({first_dim, sec_dim});
 
-    dX->Resize(framework::make_ddim({first_dim, sec_dim}));
+    dX->Resize(phi::make_ddim({first_dim, sec_dim}));
     dX->mutable_data<T>(ctx.GetPlace());
 
     framework::NPUAttributeMap attr_input = {};
-    auto runner = NpuOpRunner(std::string("SoftmaxGrad"), {tmp_out, tmp_dOut},
-                              {*dX}, attr_input);
+    const auto& runner = NpuOpRunner(std::string("SoftmaxGrad"),
+                                     {tmp_out, tmp_dOut}, {*dX}, attr_input);
 
     auto stream =
         ctx.template device_context<paddle::platform::NPUDeviceContext>()

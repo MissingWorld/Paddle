@@ -11,7 +11,7 @@ foreach(src ${OPS})
     set_source_files_properties(${src} PROPERTIES COMPILE_FLAGS ${COLLECTIVE_COMPILE_FLAGS})
 endforeach()
 
-register_operators(EXCLUDES c_gen_bkcl_id_op gen_bkcl_id_op c_gen_nccl_id_op gen_nccl_id_op c_gen_hccl_id_op gen_hccl_id_op DEPS ${COLLECTIVE_DEPS})
+register_operators(EXCLUDES c_gen_bkcl_id_op gen_bkcl_id_op c_gen_nccl_id_op gen_nccl_id_op c_gen_hccl_id_op gen_hccl_id_op c_gen_cncl_id_op DEPS ${COLLECTIVE_DEPS})
 
 if(WITH_NCCL OR WITH_RCCL)
     set(COLLECTIVE_DEPS ${COLLECTIVE_DEPS} nccl_common collective_helper)
@@ -27,6 +27,11 @@ if(WITH_XPU_BKCL)
     set(COLLECTIVE_DEPS ${COLLECTIVE_DEPS} collective_helper)
     op_library(c_gen_bkcl_id_op DEPS ${COLLECTIVE_DEPS})
     op_library(gen_bkcl_id_op DEPS ${COLLECTIVE_DEPS})
+endif()
+
+if(WITH_CNCL)
+    set(COLLECTIVE_DEPS ${COLLECTIVE_DEPS} collective_helper)
+    op_library(c_gen_cncl_id_op DEPS ${COLLECTIVE_DEPS})
 endif()
 
 if(WITH_ASCEND_CL)
@@ -59,6 +64,8 @@ if(WITH_ASCEND_CL)
         DEPS send_v2_op ${COLLECTIVE_DEPS} ${COMMON_TEST_DEPS_FOR_HCOM})
     cc_test(recv_v2_op_npu_test SRCS recv_v2_op_npu_test.cc
         DEPS recv_v2_op ${COLLECTIVE_DEPS} ${COMMON_TEST_DEPS_FOR_HCOM})
+    cc_test(checknumeric SRCS checknumeric_npu_test.cc
+        DEPS c_allreduce_sum_op ${COLLECTIVE_DEPS} ${COMMON_TEST_DEPS_FOR_HCOM})
     cc_test(c_sync_comm_stream_op_npu_test SRCS c_sync_comm_stream_op_npu_test.cc
         DEPS op_registry c_broadcast_op c_comm_init_hccl_op c_sync_comm_stream_op c_gen_hccl_id_op gen_hccl_id_op_helper ${COLLECTIVE_DEPS} ascend_hccl dynamic_loader dynload_warpctc scope device_context enforce executor)
     cc_test(c_sync_calc_stream_op_npu_test SRCS c_sync_calc_stream_op_npu_test.cc

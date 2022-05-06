@@ -65,7 +65,8 @@ class ConditionalOp : public framework::OperatorBase {
         platform::errors::InvalidArgument(
             "condition should have one initialized input as condition"));
 
-    PADDLE_ENFORCE_EQ(ips[0]->type() == framework::proto::VarType::BOOL &&
+    PADDLE_ENFORCE_EQ(framework::TransToProtoVarType(ips[0]->dtype()) ==
+                              framework::proto::VarType::BOOL &&
                           ips[0]->numel() == 1,
                       true, platform::errors::InvalidArgument(
                                 "condition input's data type should be bool, "
@@ -117,7 +118,8 @@ class ConditionalBlockOpProtoMaker : public framework::OpProtoAndCheckerMaker {
     AddAttr<std::vector<std::string>>(ConditionalOp::kSkipEagerDeletionVars,
                                       "Vars that would not be deleted when "
                                       "garbage collection strategy enables")
-        .SetDefault(std::vector<std::string>());
+        .SetDefault(std::vector<std::string>())
+        .AsExtra();
     AddComment(R"DOC(Conditional block operator
 
 If `is_scalar_condition` is True, the conditional variable (Cond) is a scalar,

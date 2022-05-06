@@ -15,8 +15,11 @@ limitations under the License. */
 #include "paddle/fluid/operators/amp/update_loss_scaling_op.h"
 #include <cmath>
 #include <vector>
+#include "paddle/fluid/framework/data_type.h"
 #include "paddle/fluid/framework/op_registry.h"
-#include "paddle/fluid/operators/npu_op_runner.h"
+#include "paddle/fluid/platform/device/npu/npu_op_runner.h"
+
+DECLARE_int32(min_loss_scaling);
 
 namespace paddle {
 namespace operators {
@@ -39,33 +42,39 @@ void Update(const platform::NPUDeviceContext& ctx,
     platform::NPUMemsetAsync(static_cast<void*>(g), 0,
                              good_out_tensor->numel() * sizeof(int), stream);
     // bad_out_data = bad_in_data + 1
-    Tensor factor_tensor(bad_out_tensor->type());
+    Tensor factor_tensor(bad_out_tensor->dtype());
     factor_tensor.mutable_data<int>({1}, place);
     FillNpuTensorWithConstant<int>(&factor_tensor, static_cast<int>(1));
-    auto runner_p2 = NpuOpRunner("Add", {*bad_in_tensor, factor_tensor},
-                                 {*bad_out_tensor}, {});
+    const auto& runner_p2 = NpuOpRunner("Add", {*bad_in_tensor, factor_tensor},
+                                        {*bad_out_tensor}, {});
     runner_p2.Run(stream);
 
     std::vector<int> bad_out_data;
-    TensorToVector(*bad_out_tensor, ctx, &bad_out_data);
-    if (bad_out_data[0] == decr_every_n_nan_or_inf) {
-      auto runner_p3 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
-                                   {*updated_loss_scaling_tensor},
-                                   {{"power", static_cast<float>(1)},
-                                    {"scale", decr_ratio},
-                                    {"shift", static_cast<float>(0)}});
+    paddle::framework::TensorToVector(*bad_out_tensor, ctx, &bad_out_data);
+    if (bad_out_data[0] >= decr_every_n_nan_or_inf) {
+      const auto& runner_p3 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
+                                          {*updated_loss_scaling_tensor},
+                                          {{"power", static_cast<float>(1)},
+                                           {"scale", decr_ratio},
+                                           {"shift", static_cast<float>(0)}});
 
       runner_p3.Run(stream);
 
       std::vector<T> new_loss_scaling;
-      TensorToVector(*updated_loss_scaling_tensor, ctx, &new_loss_scaling);
-      if (new_loss_scaling[0] < static_cast<T>(1)) {
+      paddle::framework::TensorToVector(*updated_loss_scaling_tensor, ctx,
+                                        &new_loss_scaling);
+      float min_value = 1.0;
+      if (FLAGS_min_loss_scaling > 1) {
+        min_value = static_cast<float>(FLAGS_min_loss_scaling);
+      }
+
+      if (new_loss_scaling[0] < min_value) {
         // updated_loss_scaling_data = 1
-        auto runner_p4 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
-                                     {*updated_loss_scaling_tensor},
-                                     {{"power", static_cast<float>(1)},
-                                      {"scale", static_cast<float>(0)},
-                                      {"shift", static_cast<float>(1)}});
+        const auto& runner_p4 = NpuOpRunner(
+            "Power", {*pre_loss_scaling_tensor}, {*updated_loss_scaling_tensor},
+            {{"power", static_cast<float>(1)},
+             {"scale", static_cast<float>(0)},
+             {"shift", static_cast<float>(min_value)}});
 
         runner_p4.Run(stream);
       }
@@ -82,33 +91,34 @@ void Update(const platform::NPUDeviceContext& ctx,
                              bad_out_tensor->numel() * sizeof(int), stream);
 
     // good_out_data = good_in_data + 1
-    Tensor factor_tensor(good_out_tensor->type());
+    Tensor factor_tensor(good_out_tensor->dtype());
     factor_tensor.mutable_data<int>({1}, place);
     FillNpuTensorWithConstant<int>(&factor_tensor, static_cast<int>(1));
-    auto runner_p2 = NpuOpRunner("Add", {*good_in_tensor, factor_tensor},
-                                 {*good_out_tensor}, {});
+    const auto& runner_p2 = NpuOpRunner("Add", {*good_in_tensor, factor_tensor},
+                                        {*good_out_tensor}, {});
     runner_p2.Run(stream);
 
     std::vector<int> good_out_data;
-    TensorToVector(*good_out_tensor, ctx, &good_out_data);
+    paddle::framework::TensorToVector(*good_out_tensor, ctx, &good_out_data);
 
-    if (good_out_data[0] == incr_every_n_steps) {
-      auto runner_p3 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
-                                   {*updated_loss_scaling_tensor},
-                                   {{"power", static_cast<float>(1)},
-                                    {"scale", incr_ratio},
-                                    {"shift", static_cast<float>(0)}});
+    if (good_out_data[0] >= incr_every_n_steps) {
+      const auto& runner_p3 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
+                                          {*updated_loss_scaling_tensor},
+                                          {{"power", static_cast<float>(1)},
+                                           {"scale", incr_ratio},
+                                           {"shift", static_cast<float>(0)}});
       runner_p3.Run(stream);
 
       std::vector<T> new_loss_scaling;
-      TensorToVector(*updated_loss_scaling_tensor, ctx, &new_loss_scaling);
+      paddle::framework::TensorToVector(*updated_loss_scaling_tensor, ctx,
+                                        &new_loss_scaling);
       if (!std::isfinite(new_loss_scaling[0])) {
         // updated_loss_scaling_data = pre_loss_scaling_data
-        auto runner_p4 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
-                                     {*updated_loss_scaling_tensor},
-                                     {{"power", static_cast<float>(1)},
-                                      {"scale", static_cast<float>(1)},
-                                      {"shift", static_cast<float>(0)}});
+        const auto& runner_p4 = NpuOpRunner("Power", {*pre_loss_scaling_tensor},
+                                            {*updated_loss_scaling_tensor},
+                                            {{"power", static_cast<float>(1)},
+                                             {"scale", static_cast<float>(1)},
+                                             {"shift", static_cast<float>(0)}});
 
         runner_p4.Run(stream);
       }
@@ -121,7 +131,8 @@ void Update(const platform::NPUDeviceContext& ctx,
 }
 
 template <typename T>
-class UpdateLossScalingFunctor<platform::NPUDeviceContext, T> {
+class UpdateLossScalingFunctor<platform::NPUDeviceContext, T,
+                               /*IsFoundInfOnCPU=*/true> {
  public:
   void operator()(const platform::NPUDeviceContext& dev_ctx,
                   const std::vector<bool> found_inf_vec,
@@ -145,16 +156,41 @@ class LazyZerosNPU {
                   const std::vector<bool> found_inf_vec,
                   const std::vector<const framework::Tensor*>& xs,
                   const std::vector<framework::Tensor*>& outs) const {
+    if (!xs.size()) {
+      return;
+    }
+    auto place = dev_ctx.GetPlace();
+    auto stream = dev_ctx.stream();
+    Tensor* zero_tensor;
+    void* zero_ptr;
+    if (found_inf_vec[0]) {
+      int max_num = -1;
+      for (size_t i = 0; i < xs.size(); ++i) {
+        auto* out = outs[i];
+        int num = out->numel();
+        if (max_num < num) {
+          max_num = num;
+          zero_tensor = out;
+        }
+      }
+
+      zero_tensor->mutable_data<T>(place);
+      const auto& runner_zeros =
+          NpuOpRunner("ZerosLike", {*zero_tensor}, {*zero_tensor});
+      runner_zeros.Run(stream);
+      zero_tensor->check_memory_size();
+      zero_ptr = zero_tensor->data();
+    }
+
     for (size_t i = 0; i < xs.size(); ++i) {
       auto* out = outs[i];
-      if (found_inf_vec[0]) {
-        VLOG(4) << "-- UpdateLossScaling: Find infinite grads. --";
-
-        auto place = dev_ctx.GetPlace();
-        auto stream = dev_ctx.stream();
-        auto g = out->mutable_data<T>(place);
-        platform::NPUMemsetAsync(static_cast<void*>(g), 0,
-                                 out->numel() * sizeof(T), stream);
+      auto* x = xs[i];
+      auto dst_ptr = out->mutable_data<T>(place);
+      if (!found_inf_vec[0]) {
+        framework::TensorCopy(*x, place, dev_ctx, out);
+      } else if (zero_ptr != dst_ptr) {
+        auto size = out->numel() * framework::DataTypeSize(out->dtype());
+        memory::Copy(place, dst_ptr, place, zero_ptr, size, stream);
       }
     }
   }
@@ -176,7 +212,8 @@ class UpdateLossScalingNPUKernel : public framework::OpKernel<T> {
                           "FoundInfinite must has only one element."));
 
     std::vector<bool> found_inf_vec;
-    TensorToVector(*found_inf, ctx.device_context(), &found_inf_vec);
+    paddle::framework::TensorToVector(*found_inf, ctx.device_context(),
+                                      &found_inf_vec);
 
     LazyZerosNPU<T>{}(dev_ctx, found_inf_vec, xs, outs);
     const bool stop_update = ctx.Attr<bool>("stop_update");
@@ -200,7 +237,7 @@ class UpdateLossScalingNPUKernel : public framework::OpKernel<T> {
         ctx.Attr<int>("decr_every_n_nan_or_inf");
     const float incr_ratio = ctx.Attr<float>("incr_ratio");
     const float decr_ratio = ctx.Attr<float>("decr_ratio");
-    UpdateLossScalingFunctor<DeviceContext, MPDType>{}(
+    UpdateLossScalingFunctor<DeviceContext, MPDType, true>{}(
         dev_ctx, found_inf_vec, pre_loss_scaling, good_in, bad_in,
         incr_every_n_steps, decr_every_n_nan_or_inf, incr_ratio, decr_ratio,
         updated_loss_scaling, good_out, bad_out);

@@ -13,6 +13,7 @@
 
 from __future__ import print_function
 from __future__ import division
+import os
 
 import paddle.fluid as fluid
 from paddle.fluid import core, unique_name
@@ -20,6 +21,8 @@ from ..base.private_helper_function import wait_server_ready
 from paddle.fluid.optimizer import PipelineOptimizer as PO
 from .meta_optimizer_base import MetaOptimizerBase
 from .common import OpRole, OP_ROLE_KEY, OP_ROLE_VAR_KEY, CollectiveHelper, is_loss_grad_op, is_backward_op, is_optimizer_op
+
+__all__ = []
 
 
 class PipelineOptimizer(MetaOptimizerBase):
@@ -135,6 +138,9 @@ class PipelineOptimizer(MetaOptimizerBase):
                 first_node = pair[0] + start_index
                 second_node = pair[1] + start_index
                 if self.rank != first_node and self.rank != second_node:
+                    collective_helper._init_communicator(
+                        self.startup_program, None, None, None, None, False,
+                        self.global_ring_id, True)
                     continue
                 pipeline_endpoints = [
                     self.endpoints[first_node], self.endpoints[second_node]
@@ -177,6 +183,8 @@ class PipelineOptimizer(MetaOptimizerBase):
         program._pipeline_opt['micro_batch_size'] = self.micro_batch_size
         program._pipeline_opt['schedule_mode'] = self.schedule_mode
         program._pipeline_opt['use_sharding'] = False
+        program._pipeline_opt['mp_degree'] = 1
+        program._pipeline_opt['mp_rank'] = 0
         optimize_ops, params_grads, prog_list, pp_pair, ring_map = self.wrapped_opt.minimize(
             loss, startup_program, parameter_list, no_grad_set)
         self.startup_program = orig_startup_program._pipeline_opt[

@@ -14,10 +14,11 @@ limitations under the License. */
 
 #include <memory>
 #include <string>
-#include <unordered_map>
-
-#include "paddle/fluid/operators/gelu_op.h"
-#include "paddle/fluid/platform/float16.h"
+#include "paddle/fluid/framework/infershape_utils.h"
+#include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/framework/operator.h"
+#include "paddle/phi/core/infermeta_utils.h"
+#include "paddle/phi/infermeta/unary.h"
 
 namespace paddle {
 namespace operators {
@@ -28,18 +29,6 @@ class GeluOp : public framework::OperatorWithKernel {
          const framework::VariableNameMap &outputs,
          const framework::AttributeMap &attrs)
       : OperatorWithKernel(type, inputs, outputs, attrs) {}
-
-  void InferShape(framework::InferShapeContext *ctx) const override {
-    PADDLE_ENFORCE_EQ(ctx->HasInput("X"), true,
-                      platform::errors::InvalidArgument(
-                          "Input(%s) of GeluOp should not be null.", "X"));
-    PADDLE_ENFORCE_EQ(ctx->HasOutput("Out"), true,
-                      platform::errors::InvalidArgument(
-                          "Output(%s) of GeluOp should not be null.", "Out"));
-
-    ctx->ShareDim("X", /*->*/ "Out");
-    ctx->ShareLoD("X", /*->*/ "Out");
-  }
 
  protected:
   framework::OpKernelType GetExpectedKernelType(
@@ -108,16 +97,19 @@ class GeluOpMaker : public framework::OpProtoAndCheckerMaker {
         .SetDefault(false);
     AddAttr<bool>("use_mkldnn",
                   "(bool, default false) Only used in mkldnn kernel")
-        .SetDefault(false);
+        .SetDefault(false)
+        .AsExtra();
     AddAttr<std::string>(
         "mkldnn_data_type",
         "(string, default \"float32\"). Data type of mkldnn kernel")
         .SetDefault("float32")
-        .InEnum({"float32", "int8", "bfloat16"});
+        .InEnum({"float32", "int8", "bfloat16"})
+        .AsExtra();
     AddAttr<bool>("use_cudnn",
                   "(bool, default false) Only used in cudnn kernel, need "
                   "install cudnn")
-        .SetDefault(false);
+        .SetDefault(false)
+        .AsExtra();
     AddComment(R"DOC(
 Gelu Activation Operator. 
 
@@ -153,13 +145,10 @@ class GeluGradOpMaker : public framework::SingleGradOpMaker<T> {
 
 namespace ops = paddle::operators;
 
+DECLARE_INFER_SHAPE_FUNCTOR(gelu, GeluInferShapeFunctor,
+                            PD_INFER_META(phi::UnchangedInferMeta));
 REGISTER_OPERATOR(gelu, ops::GeluOp, ops::GeluOpMaker,
                   ops::GeluGradOpMaker<paddle::framework::OpDesc>,
-                  ops::GeluGradOpMaker<paddle::imperative::OpBase>);
+                  ops::GeluGradOpMaker<paddle::imperative::OpBase>,
+                  GeluInferShapeFunctor);
 REGISTER_OPERATOR(gelu_grad, ops::GeluGradOp);
-REGISTER_OP_CPU_KERNEL(
-    gelu, ops::GeluKernel<paddle::platform::CPUDeviceContext, float>,
-    ops::GeluKernel<paddle::platform::CPUDeviceContext, double>);
-REGISTER_OP_CPU_KERNEL(
-    gelu_grad, ops::GeluGradKernel<paddle::platform::CPUDeviceContext, float>,
-    ops::GeluGradKernel<paddle::platform::CPUDeviceContext, double>);

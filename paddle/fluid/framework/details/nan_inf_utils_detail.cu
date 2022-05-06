@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "paddle/fluid/framework/convert_utils.h"
 
 namespace paddle {
 namespace framework {
@@ -40,7 +41,7 @@ static std::vector<std::mutex>& multi_op_var2gpu_str_mutex() {
 }
 
 static void InitMultiGPUOpVarMap() {
-  int dev_count = platform::GetCUDADeviceCount();
+  int dev_count = platform::GetGPUDeviceCount();
   PADDLE_ENFORCE_GT(dev_count, 0,
                     platform::errors::NotFound(
                         "cuda device must > 0, now dev_count=%d", dev_count));
@@ -123,12 +124,16 @@ __global__ void CheckNanInfKernel(const T* value, const size_t numel,
 template <>
 template <typename T>
 void TensorCheckerVisitor<platform::CUDADeviceContext>::apply(
-    typename std::enable_if<std::is_floating_point<T>::value>::type*) const {
+    typename std::enable_if<
+        std::is_floating_point<T>::value ||
+        std::is_same<T, ::paddle::platform::complex<float>>::value ||
+        std::is_same<T, ::paddle::platform::complex<double>>::value>::type*)
+    const {
   int print_num = 3;
 
   auto* dev_ctx = reinterpret_cast<platform::CUDADeviceContext*>(
       platform::DeviceContextPool::Instance().Get(tensor_.place()));
-  int dev_id = BOOST_GET_CONST(platform::CUDAPlace, tensor_.place()).device;
+  int dev_id = tensor_.place().device;
   PADDLE_ENFORCE_EQ(
       (dev_id >= 0 && dev_id < multi_op_var2gpu_str_mutex().size()), true,
       platform::errors::OutOfRange("GPU dev_id must >=0 and < dev_count=%d",
@@ -157,11 +162,11 @@ void TensorCheckerVisitor<platform::CUDADeviceContext>::apply(
                             op_var));
 
 #ifdef __HIPCC__
-      PADDLE_ENFORCE_CUDA_SUCCESS(
+      PADDLE_ENFORCE_GPU_SUCCESS(
           hipMemcpyAsync(gpu_str_ptr, iter->first.c_str(), op_var.length() + 1,
                          hipMemcpyHostToDevice, dev_ctx->stream()));
 #else
-      PADDLE_ENFORCE_CUDA_SUCCESS(
+      PADDLE_ENFORCE_GPU_SUCCESS(
           cudaMemcpyAsync(gpu_str_ptr, iter->first.c_str(), op_var.length() + 1,
                           cudaMemcpyHostToDevice, dev_ctx->stream()));
 #endif
@@ -204,7 +209,7 @@ void tensor_check<platform::CUDADeviceContext>(const std::string& op_type,
 
   TensorCheckerVisitor<platform::CUDADeviceContext> vistor(op_type, var_name,
                                                            tensor, place);
-  VisitDataType(tensor.type(), vistor);
+  VisitDataType(framework::TransToProtoVarType(tensor.dtype()), vistor);
 }
 
 }  // namespace details

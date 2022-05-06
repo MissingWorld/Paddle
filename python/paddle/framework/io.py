@@ -17,14 +17,10 @@ from __future__ import print_function
 import os
 import collections
 import pickle
-import six
 import warnings
 import sys
 import numpy as np
-
-if not six.PY2:
-    import copyreg
-
+import copyreg
 import paddle
 
 # deprecated module import
@@ -32,24 +28,33 @@ from paddle import fluid
 from paddle.fluid import core
 from paddle.fluid.io import _unpack_saved_dict, _pack_loaded_dict, _pickle_loads_mac
 from paddle.fluid.io import _legacy_save as _legacy_static_save
+from paddle.fluid.io import _open_file_buffer, _is_file_path, _is_memory_buffer
 
-from paddle.fluid.framework import Variable, _varbase_creator, _dygraph_tracer, in_dygraph_mode, ParamBase, _current_expected_place, Program
+from paddle.fluid.framework import Variable, _varbase_creator, _dygraph_tracer, _non_static_mode, ParamBase, EagerParamBase, _current_expected_place, Program
 from paddle.fluid.dygraph.jit import _SaveLoadConfig
 from paddle.fluid.dygraph.io import _construct_program_holders, _construct_params_and_buffers
 from paddle.fluid.dygraph.io import INFER_MODEL_SUFFIX, INFER_PARAMS_SUFFIX, INFER_PARAMS_INFO_SUFFIX
+try:
+    from collections.abc import Iterable
+except:
+    from collections import Iterable
 
-__all__ = [
-    'save',
-    'load',
-]
+__all__ = []
 
 
 def _build_saved_state_dict(state_dict):
     save_dict = {}
     name_table = {}
     for key, value in state_dict.items():
-        if isinstance(value, (Variable, core.VarBase)):
-            save_dict[key] = value.numpy()
+        if isinstance(value, (Variable, core.VarBase, core.eager.Tensor)):
+            if value.type == core.VarDesc.VarType.VOCAB:
+                save_dict[key] = value.value().get_map_tensor()
+            else:
+                if not value.value().get_tensor()._is_initialized():
+                    raise ValueError(
+                        "The saved tensor is not initialized. If you used group sharded, please use save_group_sharded_model."
+                    )
+                save_dict[key] = value.numpy()
             name_table[key] = value.name
         else:
             save_dict[key] = value
@@ -235,12 +240,7 @@ def _pickle_save(obj, f, protocol):
         raise ValueError("Expected 1<'protocol'<5, but received protocol={}".
                          format(protocol))
 
-    if not isinstance(obj, (core.LoDTensor, core.VarBase)):
-        raise NotImplementedError(
-            "Support 'paddle.Tensor' or 'paddle.core.LoDTensor', but received {}.".
-            format(type(obj)))
-
-    def reudce_varbase(self):
+    def reduce_varbase(self):
         data = self.numpy()
         name = self.name
 
@@ -251,16 +251,36 @@ def _pickle_save(obj, f, protocol):
 
         return (eval, ('data', {'data': data}))
 
+    def reduce_Layer(self):
+        raise ValueError(
+            "paddle do not support saving `paddle.nn.Layer` object.")
+
+    dispatch_table_layer = dict()
+
+    def create_layer_dispatch_table(layer):
+        dispatch_table_layer[layer.__class__] = reduce_Layer
+        return layer
+
+    _parse_every_object(obj, lambda v: isinstance(v, fluid.Layer),
+                        create_layer_dispatch_table)
+
     def add_dispatch_table():
         # This is not a good method, because the pickle module has been modified.
-        pickle.dispatch_table[core.VarBase] = reudce_varbase
-        pickle.dispatch_table[ParamBase] = reudce_varbase
+        pickle.dispatch_table[core.VarBase] = reduce_varbase
+        pickle.dispatch_table[ParamBase] = reduce_varbase
+        pickle.dispatch_table[core.eager.Tensor] = reduce_varbase
+        pickle.dispatch_table[EagerParamBase] = reduce_varbase
         pickle.dispatch_table[core.LoDTensor] = reduce_LoDTensor
+        pickle.dispatch_table.update(dispatch_table_layer)
 
     def pop_dispatch_table():
         pickle.dispatch_table.pop(core.VarBase)
         pickle.dispatch_table.pop(core.LoDTensor)
         pickle.dispatch_table.pop(ParamBase)
+        pickle.dispatch_table.pop(core.eager.Tensor)
+        pickle.dispatch_table.pop(EagerParamBase)
+        for k in dispatch_table_layer:
+            pickle.dispatch_table.pop(k)
 
     # When value of dict is lager than 4GB ,there is a Bug on 'MAC python3'
     if sys.platform == 'darwin' and sys.version_info.major == 3:
@@ -272,36 +292,69 @@ def _pickle_save(obj, f, protocol):
         for i in range(0, len(pickle_bytes), max_bytes):
             f.write(pickle_bytes[i:i + max_bytes])
     else:
-        if six.PY2:
-            add_dispatch_table()
-            pickle_bytes = pickle.dump(obj, f, protocol)
-            pop_dispatch_table()
+        pickler = pickle.Pickler(f, protocol)
+        pickler.dispatch_table = copyreg.dispatch_table.copy()
+
+        pickler.dispatch_table[core.VarBase] = reduce_varbase
+        pickler.dispatch_table[core.LoDTensor] = reduce_LoDTensor
+        pickler.dispatch_table[ParamBase] = reduce_varbase
+        pickler.dispatch_table[core.eager.Tensor] = reduce_varbase
+        pickler.dispatch_table[EagerParamBase] = reduce_varbase
+        pickler.dispatch_table.update(dispatch_table_layer)
+        pickler.dump(obj)
+
+
+def _contain_x(obj, condition_func):
+    if isinstance(obj, core.SelectedRows):
+        raise NotImplementedError(
+            "`paddle.save` do not support saving 'SelectedRows'.")
+
+    if condition_func(obj):
+        return True
+    elif type(obj) in (dict, collections.OrderedDict, list, tuple):
+        if type(obj) in (dict, collections.OrderedDict):
+            keys = list(obj.keys())
         else:
-            pickler = pickle.Pickler(f, protocol)
-            pickler.dispatch_table = copyreg.dispatch_table.copy()
-
-            pickler.dispatch_table[core.VarBase] = reudce_varbase
-            pickler.dispatch_table[core.LoDTensor] = reduce_LoDTensor
-            pickler.dispatch_table[ParamBase] = reudce_varbase
-
-            pickler.dump(obj)
-
-
-def _use_legacy(obj):
-    # TODO(weixin):If `obj` is any object, the judgment condition should be more precise.
-    if not isinstance(obj, dict):
+            keys = range(len(obj))
+        flag = False
+        for key in keys:
+            flag |= _contain_x(obj[key], condition_func)
+            if flag:
+                return True
+        return flag
+    else:
         return False
-    return True
+
+
+def _is_state_dict(obj):
+    if isinstance(obj, dict):
+
+        def condition(obj):
+            return isinstance(obj, (fluid.Layer, Program, core.VarBase,
+                                    core.eager.Tensor, core.LoDTensor,
+                                    core.SelectedRows))
+
+        # If the value of a dict is a core.VarBase/LoDTensor or a dict 
+        # that does not contain a paddle type(Layer, Program, VarBase, LoDTensor, SelectedRows), 
+        # the dict is considered to be a state_ dict.
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    if _contain_x(v, condition):
+                        return False
+            elif not isinstance(value, (core.VarBase, core.eager.Tensor,
+                                        core.LoDTensor)):
+                return False
+        return True
+
+    return False
 
 
 def _transformed_from_varbase(obj):
     # In paddle2.1 version, VarBase is saved as tuple(tensor.name, tensor.numpy()).
     # When executing paddle.load, use this function to determine whether to restore to VarBase/LoDTensor.
     if isinstance(obj, tuple) and len(obj) == 2:
-        if six.PY2:
-            name_types = (str, unicode)
-        else:
-            name_types = str
+        name_types = str
         if isinstance(obj[0], name_types) and isinstance(obj[1], np.ndarray):
             return True
     return False
@@ -329,7 +382,7 @@ def _to_LodTensor(ndarray):
 def _tuple_to_tensor(obj, return_numpy):
     if return_numpy:
         return obj[1]
-    if in_dygraph_mode():
+    if _non_static_mode():
         t = paddle.to_tensor(obj[1])
         # This function does modify the name of return value.
         # Loading the same variable multiple times may cause the same name.
@@ -342,39 +395,163 @@ def _tuple_to_tensor(obj, return_numpy):
 def _ndarray_to_tensor(obj, return_numpy):
     if return_numpy:
         return obj
-    if in_dygraph_mode():
+    if _non_static_mode():
         return paddle.to_tensor(obj)
     else:
         return _to_LodTensor(obj)
 
 
+def _lod_tensor2varbase(tensor):
+    return_var = _varbase_creator()
+    return_var.value().get_tensor().set(tensor, _current_expected_place())
+    return return_var
+
+
+def _parse_every_object(obj, condition_func, convert_func):
+    if condition_func(obj):
+        return convert_func(obj)
+    elif type(obj) in (dict, collections.OrderedDict, list):
+        if type(obj) == list:
+            keys = range(len(obj))
+        else:
+            keys = list(obj.keys())
+        for key in keys:
+            if condition_func(obj[key]):
+                obj[key] = convert_func(obj[key])
+            else:
+                obj[key] = _parse_every_object(obj[key], condition_func,
+                                               convert_func)
+        return obj
+    elif type(obj) == tuple:
+        return tuple(
+            _parse_every_object(list(obj), condition_func, convert_func))
+    elif type(obj) == set:
+        return set(_parse_every_object(list(obj), condition_func, convert_func))
+    else:
+        if isinstance(obj, Iterable) and not isinstance(
+                obj,
+            (str, np.ndarray, core.VarBase, core.eager.Tensor, core.LoDTensor)):
+            raise NotImplementedError(
+                "The iteratable objects supported are tuple, list, dict, OrderedDict, string. But received {}.".
+                format(type(obj)))
+        return obj
+
+
+def _parse_load_result(obj, return_numpy):
+    def is_layer(obj):
+        return isinstance(obj, fluid.Layer)
+
+    def parse_layer(obj):
+        temp_dict = _parse_load_result(obj.__dict__, False)
+        obj.__dict__.update(temp_dict)
+        return obj
+
+    if _contain_x(obj, is_layer):
+        if not _non_static_mode():
+            raise ValueError(
+                "Layer can only be loaded in dynamic graph mode, but now in static graph mode."
+            )
+
+        _parse_every_object(obj, is_layer, parse_layer)
+
+    def tuple_to_tensor(obj):
+        return _tuple_to_tensor(obj, return_numpy=return_numpy)
+
+    def ndarray_to_tensor(obj):
+        return _ndarray_to_tensor(obj, return_numpy=return_numpy)
+
+    # tuple(name, ndarry) was converted from varbase of paddle2.1, 
+    # and all tuple(name, ndarry) are converted to tensor.
+    if _contain_x(obj, _transformed_from_varbase):
+        return _parse_every_object(obj, _transformed_from_varbase,
+                                   tuple_to_tensor)
+    # If there is no tuple(name, ndary), it is considered to be saved by paddle2.0 
+    # or converted from LoDTensor, and all ndarrays are converted to tensor.
+    else:
+        return _parse_every_object(obj, _transformed_from_lodtensor,
+                                   ndarray_to_tensor)
+
+
 def _save_lod_tensor(tensor, file_name):
     if not tensor._is_initialized():
-        raise ValueError("The saved tensor is not initialized.")
-    _seek = core._save_lod_tensor(tensor, file_name)
-    # '_seek' is the end position of this tensor in the file.
+        raise ValueError(
+            "The saved tensor is not initialized. If you used group sharded, please use save_group_sharded_model firstly."
+        )
+    if _is_file_path(file_name):
+        _seek = core.save_lod_tensor(tensor, file_name)
+        # '_seek' is the end position of this tensor in the file.
+
+    elif _is_memory_buffer(file_name):
+        tensor_bytes = core.save_lod_tensor_to_memory(tensor)
+
+        with _open_file_buffer(file_name, 'wb') as f:
+            f.write(tensor_bytes)
+            _seek = f.tell()
+
+    else:
+        raise NotImplementedError(
+            'Only supports saving objects to file or BytesIO, but received {}'.
+            format(type(file_name)))
     return _seek
 
 
 def _load_lod_tensor(file_name):
     temp_t = paddle.fluid.core.LoDTensor()
-    # '_seek' is the end position of this tensor in the file.
-    _seek = paddle.fluid.core._load_lod_tensor(temp_t, file_name)
+    if _is_file_path(file_name):
+        # '_seek' is the end position of this tensor in the file.
+        _seek = paddle.fluid.core.load_lod_tensor(temp_t, file_name)
+
+    elif _is_memory_buffer(file_name):
+        with _open_file_buffer(file_name, 'rb') as f:
+            tensor_bytes = f.read()
+            paddle.fluid.core.load_lod_tensor_from_memory(temp_t, tensor_bytes)
+            _seek = f.tell()
+
+    else:
+        raise NotImplementedError(
+            'Only supports load objects from file or BytesIO, but received {}'.
+            format(type(file_name)))
+
     return temp_t, _seek
 
 
 def _save_selected_rows(selected_rows, file_name):
-    # '_seek' is the end position of this SelectedRows in the file.
     if not selected_rows.get_tensor()._is_initialized():
         raise ValueError("The saved tensor is not initialized.")
-    _seek = core._save_selected_rows(selected_rows, file_name)
+    if _is_file_path(file_name):
+        # '_seek' is the end position of this SelectedRows in the file.
+        _seek = core.save_selected_rows(selected_rows, file_name)
+
+    elif _is_memory_buffer(file_name):
+        selected_rows_bytes = core.save_selected_rows_to_memory(selected_rows)
+        with _open_file_buffer(file_name, 'wb') as f:
+            f.write(selected_rows_bytes)
+            _seek = f.tell()
+    else:
+        raise NotImplementedError(
+            'Only supports saving objects to file or BytesIO, but received {}'.
+            format(type(file_name)))
     return _seek
 
 
 def _load_selected_rows(file_name):
     temp_sr = core.SelectedRows()
-    # '_seek' is the end position of this SelectedRows in the file.
-    _seek = core._load_selected_rows(temp_sr, file_name)
+    if _is_file_path(file_name):
+        # '_seek' is the end position of this SelectedRows in the file.
+        _seek = core.load_selected_rows(temp_sr, file_name)
+
+    elif _is_memory_buffer(file_name):
+        with _open_file_buffer(file_name, 'rb') as f:
+            selected_rows_bytes = f.read()
+            paddle.fluid.core.load_selected_rows_from_memory(
+                temp_sr, selected_rows_bytes)
+        _seek = f.tell()
+
+    else:
+        raise NotImplementedError(
+            'Only supports load objects from file or BytesIO, but received {}'.
+            format(type(file_name)))
+
     return temp_sr, _seek
 
 
@@ -383,6 +560,8 @@ def _save_binary_var(obj, path):
         _save_lod_tensor(obj, path)
     elif isinstance(obj, core.SelectedRows):
         _save_selected_rows(obj, path)
+    elif isinstance(obj, (core.VarBase, core.eager.Tensor)):
+        _save_lod_tensor(obj.value().get_tensor(), path)
     else:
         # Since the concept of 'Tensor' is only exposed to users, the error message can only contain tensor instead of 'LoDTensor' or 'SelectedRows'
         raise NotImplementedError(
@@ -390,12 +569,12 @@ def _save_binary_var(obj, path):
             format(type(obj)))
 
 
-def save(obj, path, protocol=2, **configs):
+def save(obj, path, protocol=4, **configs):
     '''
     Save an object to the specified path.
     
     .. note::
-        Now supports saving ``state_dict`` of Layer or Optimizer, Tensor.
+        Now supports saving ``state_dict`` of Layer/Optimizer, Tensor and nested structure containing Tensor, Program.
 
     .. note::
         Different from ``paddle.jit.save``, since the save result of ``paddle.save`` is a single file, 
@@ -408,10 +587,10 @@ def save(obj, path, protocol=2, **configs):
     
     Args:
         obj(Object) : The object to be saved.
-        path(str) : The path of the object to be saved. 
+        path(str|BytesIO) : The path/buffer of the object to be saved. 
           If saved in the current directory, the input path string will be used as the file name. 
         protocol(int, optional): The protocol version of pickle module must be greater than 1 and less than 5.
-                                 Default: 2
+                                 Default: 4
         **configs(dict, optional): optional keyword arguments. The following options are currently supported:
           use_binary_format(bool): When the saved object is static graph variable, you can specify ``use_binary_for_var``. 
           If True, save the file in the c++ binary format when saving a single static graph variable; otherwise, save it in pickle format.
@@ -443,7 +622,18 @@ def save(obj, path, protocol=2, **configs):
             # save weight of emb
             paddle.save(emb.weight, "emb.weight.pdtensor")
 
-            # example 2: static graph
+            # example 2: Save multiple state_dict at the same time
+            from paddle import nn
+            from paddle.optimizer import Adam
+
+            layer = paddle.nn.Linear(3, 4)
+            adam = Adam(learning_rate=0.001, parameters=layer.parameters())
+            obj = {'model': layer.state_dict(), 'opt': adam.state_dict(), 'epoch': 100}
+            path = 'example/model.pdparams'
+            paddle.save(obj, path)
+
+
+            # example 3: static graph
             import paddle
             import paddle.static as static
 
@@ -459,7 +649,7 @@ def save(obj, path, protocol=2, **configs):
             prog = paddle.static.default_main_program()
             for var in prog.list_vars():
                 if list(var.shape) == [224, 10]:
-                    tensor = var.get_tensor()
+                    tensor = var.get_value()
                     break
 
             # save/load tensor
@@ -469,18 +659,51 @@ def save(obj, path, protocol=2, **configs):
             # save/load state_dict
             path_state_dict = 'temp/model.pdparams'
             paddle.save(prog.state_dict("param"), path_tensor)
-    '''
-    # 1. input check
-    filename = os.path.basename(path)
-    if filename == "":
-        raise ValueError("The input path MUST be format of dirname/filename "
-                         "[dirname\\filename in Windows system], but received "
-                         "filename is empty string.")
 
-    # 2. save object
-    dirname = os.path.dirname(path)
-    if dirname and not os.path.exists(dirname):
-        os.makedirs(dirname)
+            # example 4: save program
+            import paddle
+
+            paddle.enable_static()
+
+            data = paddle.static.data(
+                name='x_static_save', shape=(None, 224), dtype='float32')
+            y_static = z = paddle.static.nn.fc(data, 10)
+            main_program = paddle.static.default_main_program()
+            path = "example/main_program.pdmodel"
+            paddle.save(main_program, path)
+
+
+            # example 5: save object to memory
+            from io import BytesIO
+            import paddle
+            from paddle.nn import Linear
+            paddle.disable_static()
+
+            linear = Linear(5, 10)
+            state_dict = linear.state_dict()
+            byio = BytesIO()
+            paddle.save(state_dict, byio)
+            tensor = paddle.randn([2, 3], dtype='float32')
+            paddle.save(tensor, byio)
+    
+    '''
+    if _is_file_path(path):
+        # 1. input check
+        filename = os.path.basename(path)
+        if filename == "":
+            raise ValueError(
+                "The input path MUST be format of dirname/filename "
+                "[dirname\\filename in Windows system], but received "
+                "filename is empty string.")
+
+        # 2. save object
+        dirname = os.path.dirname(path)
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname)
+    elif not _is_memory_buffer(path):
+        raise ValueError(
+            "only supports saving objects to file and `BytesIO`, but got {}".
+            format(type(path)))
 
     config = _parse_save_config(configs)
 
@@ -498,32 +721,20 @@ def save(obj, path, protocol=2, **configs):
             warnings.warn(
                 "'pickle_protocol' is a deprecated argument. Please use 'protocol' instead."
             )
+
         if isinstance(obj, Program):
             obj.desc.flush()
-            with open(path, "wb") as f:
+            with _open_file_buffer(path, "wb") as f:
                 f.write(obj.desc.serialize_to_string())
-        elif _use_legacy(obj):
-            if in_dygraph_mode():
+
+        elif _is_state_dict(obj):
+            if _non_static_mode():
                 _legacy_save(obj, path, protocol)
             else:
                 _legacy_static_save(obj, path, protocol)
         else:
-            # `protocol` need to be used, `pickle_protocol` is a deprecated arg.
-            if config.pickle_protocol is not None:
-                protocol = config.pickle_protocol
-                warnings.warn(
-                    "'pickle_protocol' is a deprecated argument. Please use 'protocol' instead."
-                )
-
-            if _use_legacy(obj):
-                if in_dygraph_mode():
-                    _legacy_save(obj, path, protocol)
-                else:
-                    _legacy_static_save(obj, path, protocol)
-            else:
-                # save single variable
-                with open(path, 'wb') as f:
-                    _pickle_save(obj, f, protocol)
+            with _open_file_buffer(path, 'wb') as f:
+                _pickle_save(obj, f, protocol)
 
 
 def _legacy_save(obj, path, protocol=2):
@@ -536,12 +747,6 @@ def _legacy_save(obj, path, protocol=2):
     if len(obj) == 0:
         warnings.warn("The input state dict is empty, no need to save.")
 
-    filename = os.path.basename(path)
-    if filename == "":
-        raise ValueError("The input path MUST be format of dirname/filename "
-                         "[dirname\\filename in Windows system], but received "
-                         "filename is empty string.")
-
     if not isinstance(protocol, int):
         raise ValueError("The 'protocol' MUST be `int`, but received {}".format(
             type(protocol)))
@@ -550,26 +755,33 @@ def _legacy_save(obj, path, protocol=2):
         raise ValueError("Expected 1<'protocol'<5, but received protocol={}".
                          format(protocol))
 
-    # 2. save object
-    dirname = os.path.dirname(path)
-    if dirname and not os.path.exists(dirname):
-        os.makedirs(dirname)
+    if _is_file_path(path):
+        filename = os.path.basename(path)
+        if filename == "":
+            raise ValueError(
+                "The input path MUST be format of dirname/filename "
+                "[dirname\\filename in Windows system], but received "
+                "filename is empty string.")
+        # 2. save object
+        dirname = os.path.dirname(path)
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname)
 
-    # TODO(chenweihang): supports save other object
     if isinstance(obj, dict):
         saved_obj = _build_saved_state_dict(obj)
 
     saved_obj = _unpack_saved_dict(saved_obj, protocol)
 
     # When value of dict is lager than 4GB ,there is a Bug on 'MAC python3'
-    if sys.platform == 'darwin' and sys.version_info.major == 3:
+    if _is_file_path(
+            path) and sys.platform == 'darwin' and sys.version_info.major == 3:
         pickle_bytes = pickle.dumps(saved_obj, protocol=protocol)
         with open(path, 'wb') as f:
             max_bytes = 2**30
             for i in range(0, len(pickle_bytes), max_bytes):
                 f.write(pickle_bytes[i:i + max_bytes])
     else:
-        with open(path, 'wb') as f:
+        with _open_file_buffer(path, 'wb') as f:
             pickle.dump(saved_obj, f, protocol=protocol)
 
 
@@ -578,7 +790,7 @@ def load(path, **configs):
     Load an object can be used in paddle from specified path.
 
     .. note::
-        Now supports load ``state_dict`` of Layer or Optimizer, Tensor.
+        Now supports loading ``state_dict`` of Layer/Optimizer, Tensor and nested structure containing Tensor, Program.
 
     .. note::
         In order to use the model parameters saved by paddle more efficiently, 
@@ -604,7 +816,7 @@ def load(path, **configs):
         ``Layer.set_state_dict`` later.
 
     Args:
-        path(str) : The path to load the target object. Generally, the path is the target 
+        path(str|BytesIO) : The path/buffer to load the target object. Generally, the path is the target 
             file path. When loading state_dict from the saved result of the API used to save 
             the inference model, the path may be a file prefix or directory.
         **configs (dict, optional): other load configuration options for compatibility. We do not 
@@ -624,8 +836,6 @@ def load(path, **configs):
 
     Examples:
         .. code-block:: python
-
-            import paddle
 
             # example 1: dynamic graph
             import paddle
@@ -655,7 +865,19 @@ def load(path, **configs):
             load_weight = paddle.load("emb.weight.pdtensor")
 
 
-            # example 2: static graph
+            # example 2: Load multiple state_dict at the same time
+            from paddle import nn
+            from paddle.optimizer import Adam
+
+            layer = paddle.nn.Linear(3, 4)
+            adam = Adam(learning_rate=0.001, parameters=layer.parameters())
+            obj = {'model': layer.state_dict(), 'opt': adam.state_dict(), 'epoch': 100}
+            path = 'example/model.pdparams'
+            paddle.save(obj, path)
+            obj_load = paddle.load(path)
+
+
+            # example 3: static graph
             import paddle
             import paddle.static as static
 
@@ -671,7 +893,7 @@ def load(path, **configs):
             prog = paddle.static.default_main_program()
             for var in prog.list_vars():
                 if list(var.shape) == [224, 10]:
-                    tensor = var.get_tensor()
+                    tensor = var.get_value()
                     break
 
             # save/load tensor
@@ -684,55 +906,74 @@ def load(path, **configs):
             paddle.save(prog.state_dict("param"), path_tensor)
             load_state_dict = paddle.load(path_tensor)
 
+
+            # example 4: load program
+            import paddle
+
+            paddle.enable_static()
+
+            data = paddle.static.data(
+                name='x_static_save', shape=(None, 224), dtype='float32')
+            y_static = z = paddle.static.nn.fc(data, 10)
+            main_program = paddle.static.default_main_program()
+            path = "example/main_program.pdmodel"
+            paddle.save(main_program, path)
+            load_main = paddle.load(path)
+            print(load_main)
+
+
+            # example 5: save object to memory
+            from io import BytesIO
+            import paddle
+            from paddle.nn import Linear
+            paddle.disable_static()
+
+            linear = Linear(5, 10)
+            state_dict = linear.state_dict()
+            byio = BytesIO()
+            paddle.save(state_dict, byio)
+            tensor = paddle.randn([2, 3], dtype='float32')
+            paddle.save(tensor, byio)
+            byio.seek(0)
+            # load state_dict
+            dict_load = paddle.load(byio)
+
     '''
 
-    if os.path.isfile(path):
+    if _is_memory_buffer(path) or os.path.isfile(path):
         config = _parse_load_config(configs)
-        if six.PY2:
-            exception_type = KeyError
-        else:
-            exception_type = pickle.UnpicklingError
+        exception_type = pickle.UnpicklingError
         try:
-            with open(path, 'rb') as f:
+            with _open_file_buffer(path, 'rb') as f:
                 # When value of dict is lager than 4GB ,there is a Bug on 'MAC python3'
-                if sys.platform == 'darwin' and sys.version_info.major == 3:
+                if _is_file_path(
+                        path
+                ) and sys.platform == 'darwin' and sys.version_info.major == 3:
                     load_result = _pickle_loads_mac(path, f)
                 else:
-                    load_result = pickle.load(f) if six.PY2 else pickle.load(
-                        f, encoding='latin1')
+                    load_result = pickle.load(f, encoding='latin1')
 
                 # TODO(weixin):If `obj` is any object, the judgment condition should be more precise.
                 if isinstance(load_result, dict):
-                    if isinstance(load_result, dict):
-                        load_result = _pack_loaded_dict(load_result)
+                    load_result = _pack_loaded_dict(load_result)
                     # paddle2.0: paddle.save/load
                     if "StructuredToParameterName@@" in load_result:
 
                         for key in load_result["StructuredToParameterName@@"]:
-                            load_result[key] = _ndarray_to_tensor(
-                                load_result[key], config.return_numpy)
+                            if isinstance(load_result[key], np.ndarray):
+                                load_result[key] = _ndarray_to_tensor(
+                                    load_result[key], config.return_numpy)
 
                         if not config.keep_name_table and "StructuredToParameterName@@" in load_result:
                             del load_result["StructuredToParameterName@@"]
                     else:
                         # paddle2.1 static.save/load
-                        for key in load_result:
-                            load_result[key] = _ndarray_to_tensor(
-                                load_result[key], config.return_numpy)
+                        load_result = _parse_load_result(load_result,
+                                                         config.return_numpy)
 
                 else:
-                    # TODO(weixin): support complex objects such as layer.
-                    # If `obj` is any object, the judgment condition should be more precise.
-                    if _transformed_from_lodtensor(load_result):
-                        load_result = _ndarray_to_tensor(load_result,
-                                                         config.return_numpy)
-                    elif _transformed_from_varbase(load_result):
-                        load_result = _tuple_to_tensor(load_result,
-                                                       config.return_numpy)
-                    else:
-                        raise NotImplementedError(
-                            'Only support tensor and state_dict, but received {}.'.
-                            format(type(load_result)))
+                    load_result = _parse_load_result(load_result,
+                                                     config.return_numpy)
 
         except exception_type as msg_pickle:
             try:
@@ -741,10 +982,15 @@ def load(path, **configs):
             except:
                 try:
                     tensor, _ = _load_lod_tensor(path)
-                    return tensor
+                    if config.return_numpy:
+                        return np.array(tensor)
+                    else:
+                        if _non_static_mode():
+                            return _lod_tensor2varbase(tensor)
+                        return tensor
                 except:
                     try:
-                        with open(path, "rb") as f:
+                        with _open_file_buffer(path, "rb") as f:
                             program_desc_str = f.read()
                             program = Program.parse_from_string(
                                 program_desc_str)
@@ -764,11 +1010,10 @@ def _legacy_load(path, **configs):
     load_result = None
     config = _parse_load_config(configs)
 
-    if os.path.isfile(path):
+    if os.path.isfile(path) or _is_memory_buffer(path):
         # we think path is file means this file is created by paddle.save
-        with open(path, 'rb') as f:
-            load_result = pickle.load(f) if six.PY2 else pickle.load(
-                f, encoding='latin1')
+        with _open_file_buffer(path, 'rb') as f:
+            load_result = pickle.load(f, encoding='latin1')
         load_result = _pack_loaded_dict(load_result)
         if not config.keep_name_table and "StructuredToParameterName@@" in load_result:
             del load_result["StructuredToParameterName@@"]

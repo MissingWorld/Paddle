@@ -119,8 +119,8 @@ class DataNormOp : public framework::OperatorWithKernel {
                                             bias_dim, bias_dim.size()));
 
       bool check = true;
-      if ((!ctx->IsRuntime()) && (framework::product(scale_dim) <= 0 ||
-                                  framework::product(bias_dim) <= 0)) {
+      if ((!ctx->IsRuntime()) &&
+          (phi::product(scale_dim) <= 0 || phi::product(bias_dim) <= 0)) {
         check = false;
       }
 
@@ -232,7 +232,8 @@ class DataNormOpMaker : public framework::OpProtoAndCheckerMaker {
         .SetDefault(false);
     AddAttr<bool>("use_mkldnn",
                   "(bool, default false) Only used in mkldnn kernel")
-        .SetDefault(false);
+        .SetDefault(false)
+        .AsExtra();
     AddInput("X", "The input tensor");
     AddInput("BatchSize",
              "BatchSize is a 1-dimensional tensor of size C "

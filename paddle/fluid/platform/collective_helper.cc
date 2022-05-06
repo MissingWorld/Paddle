@@ -15,7 +15,9 @@
 #include "paddle/fluid/platform/collective_helper.h"
 #include <utility>
 
-#include "paddle/fluid/platform/cuda_resource_pool.h"
+#include "paddle/fluid/memory/allocation/allocator_facade.h"
+#include "paddle/fluid/platform/device/device_wrapper.h"
+#include "paddle/fluid/platform/device/gpu/gpu_resource_pool.h"
 
 namespace paddle {
 namespace platform {
@@ -31,9 +33,7 @@ class NCCLCommImpl : public NCCLComm {
   void set_rank(int rank) { rank_ = rank; }
   int rank() const override { return rank_; }
 
-  int device_id() const override {
-    return BOOST_GET_CONST(CUDAPlace, dev_ctx_->GetPlace()).device;
-  }
+  int device_id() const override { return dev_ctx_->GetPlace().device; }
 
   void set_comm(ncclComm_t comm) { comm_ = comm; }
   ncclComm_t comm() const override { return comm_; }
@@ -72,8 +72,8 @@ class NCCLCommImpl : public NCCLComm {
   std::shared_ptr<platform::CudaEventObject> comm_event_;
 };
 
-NCCLComm* NCCLCommContext::CreateNCCLComm(ncclUniqueId* nccl_id, int nranks,
-                                          int rank, int dev_id, int ring_id) {
+NCCLComm* NCCLCommContext::CreateComm(ncclUniqueId* nccl_id, int nranks,
+                                      int rank, int dev_id, int ring_id) {
   PADDLE_ENFORCE_NOT_NULL(nccl_id,
                           platform::errors::InvalidArgument(
                               "The nccl unique id should not be null."));
@@ -96,7 +96,7 @@ NCCLComm* NCCLCommContext::CreateNCCLComm(ncclUniqueId* nccl_id, int nranks,
 
   ncclComm_t comm = nullptr;
   SetDeviceId(dev_id);
-  PADDLE_ENFORCE_CUDA_SUCCESS(
+  PADDLE_ENFORCE_GPU_SUCCESS(
       platform::dynload::ncclCommInitRank(&comm, nranks, *nccl_id, rank));
 
   auto* comm_wrapper = AssignNCCLComm(comm, nranks, rank, dev_id, ring_id);
@@ -121,7 +121,7 @@ void NCCLCommContext::CreateAllNCCLComms(const std::vector<int>& dev_ids,
 
   const int kDevices = dev_ids.size();
   ncclComm_t comms[kDevices];
-  PADDLE_ENFORCE_CUDA_SUCCESS(platform::dynload::ncclCommInitAll(
+  PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclCommInitAll(
       comms, dev_ids.size(), dev_ids.data()));
 
   PADDLE_ENFORCE_EQ(comm_map_.count(ring_id), 0,
@@ -140,10 +140,70 @@ void NCCLCommContext::CreateAllNCCLComms(const std::vector<int>& dev_ids,
   });
 }
 
+void NCCLCommContext::CreateNCCLCommMultiTrainer(
+    const std::vector<int>& dev_ids, ncclUniqueId* nccl_id, int ntrainers,
+    int train_id, int ring_id) {
+  PADDLE_ENFORCE_GT(
+      dev_ids.size(), 0,
+      paddle::platform::errors::InvalidArgument(
+          "dev ids = [%d], it should greater than 0.", dev_ids.size()));
+  const int kDevices = dev_ids.size();
+  VLOG(1) << "Begin CreateNCCLCommMultiTrainer. device number: " << kDevices
+          << ", ntrainers: " << ntrainers << ", train_id: " << train_id
+          << ", rind_id: " << ring_id;
+  ncclComm_t comms[kDevices];
+  {
+    PADDLE_ENFORCE_GPU_SUCCESS(dynload::ncclGroupStart());
+    for (int i = 0; i < kDevices; i++) {
+#ifdef PADDLE_WITH_HIP
+      PADDLE_ENFORCE_GPU_SUCCESS(hipSetDevice(i));
+#else
+      PADDLE_ENFORCE_GPU_SUCCESS(cudaSetDevice(i));
+#endif
+      platform::dynload::ncclCommInitRank(comms + i, kDevices * ntrainers,
+                                          *nccl_id, train_id * kDevices + i);
+      VLOG(1) << "ncclCommInitRank: " << i;
+    }
+    PADDLE_ENFORCE_GPU_SUCCESS(dynload::ncclGroupEnd());
+    VLOG(1) << "nccl group end seccessss";
+  }
+  PADDLE_ENFORCE_EQ(comm_map_.count(ring_id), 0,
+                    platform::errors::InvalidArgument(
+                        "comm_map_ of ring_id: %s should be 0. %s is provided",
+                        ring_id, comm_map_.count(ring_id)));
+  for (int i = 0; i < kDevices; ++i) {
+    AssignNCCLComm(comms[i], kDevices * ntrainers, train_id * kDevices + i,
+                   dev_ids[i], ring_id);
+    VLOG(1) << "nccl communicator of train_id " << train_id * kDevices + i
+            << " in ring " << ring_id << " has been created on device "
+            << dev_ids[i];
+  }
+
+  std::call_once(once_flag_, []() {
+    std::atexit([]() { NCCLCommContext::Instance().ReleaseNCCLComms(); });
+  });
+}
+
 NCCLComm* NCCLCommContext::AssignNCCLComm(ncclComm_t comm, int nranks, int rank,
                                           int dev_id, int ring_id) {
   std::unique_ptr<CUDADeviceContext> dev_ctx(
       new CUDADeviceContext(CUDAPlace(dev_id)));
+  dev_ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
+                            .GetAllocator(CUDAPlace(dev_id), dev_ctx->stream())
+                            .get());
+  dev_ctx->SetHostAllocator(
+      paddle::memory::allocation::AllocatorFacade::Instance()
+          .GetAllocator(paddle::platform::CPUPlace())
+          .get());
+  dev_ctx->SetZeroAllocator(
+      paddle::memory::allocation::AllocatorFacade::Instance()
+          .GetZeroAllocator(CUDAPlace(dev_id))
+          .get());
+  dev_ctx->SetPinnedAllocator(
+      paddle::memory::allocation::AllocatorFacade::Instance()
+          .GetAllocator(paddle::platform::CUDAPinnedPlace())
+          .get());
+  dev_ctx->PartialInitWithAllocator();
 
   std::shared_ptr<platform::CudaEventObject> compute_event(
       platform::CudaEventResourcePool::Instance().New(dev_id));
@@ -201,9 +261,7 @@ class BKCLCommImpl : public BKCLComm {
   void set_rank(int rank) { rank_ = rank; }
   int rank() const override { return rank_; }
 
-  int device_id() const override {
-    return BOOST_GET_CONST(XPUPlace, dev_ctx_->GetPlace()).device;
-  }
+  int device_id() const override { return dev_ctx_->GetPlace().device; }
 
   void set_comm(BKCLContext_t comm) { comm_ = comm; }
   BKCLContext_t comm() const override { return comm_; }
@@ -225,8 +283,8 @@ class BKCLCommImpl : public BKCLComm {
   std::unique_ptr<XPUDeviceContext> dev_ctx_;
 };
 
-BKCLComm* BKCLCommContext::CreateBKCLComm(BKCLUniqueId* bkcl_id, int nranks,
-                                          int rank, int dev_id, int ring_id) {
+BKCLComm* BKCLCommContext::CreateComm(BKCLUniqueId* bkcl_id, int nranks,
+                                      int rank, int dev_id, int ring_id) {
   PADDLE_ENFORCE_NOT_NULL(bkcl_id,
                           platform::errors::InvalidArgument(
                               "The bkcl unique id should not be null."));
@@ -248,17 +306,8 @@ BKCLComm* BKCLCommContext::CreateBKCLComm(BKCLUniqueId* bkcl_id, int nranks,
           "Expected dev_id >= 0. But received dev_id is %d.", dev_id));
 
   BKCLContext_t comm = nullptr;
-  auto ret = xpu_set_device(dev_id);
-  PADDLE_ENFORCE_EQ(
-      ret, XPU_SUCCESS,
-      platform::errors::PreconditionNotMet(
-          "XPU API return wrong value[%d %s], please check whether "
-          "Baidu Kunlun Card is properly installed.",
-          ret, XPUAPIErrorMsg[ret]));
-  ret = bkcl_init_rank(&comm, rank, nranks, bkcl_id);
-  PADDLE_ENFORCE_EQ(ret, BKCL_SUCCESS,
-                    platform::errors::PreconditionNotMet(
-                        "bkcl_init_rank failed, got wrong value [%d].", ret));
+  platform::SetXPUDeviceId(dev_id);
+  PADDLE_ENFORCE_XPU_SUCCESS(bkcl_init_rank(&comm, rank, nranks, bkcl_id));
 
   auto* comm_wrapper = AssignBKCLComm(comm, nranks, rank, dev_id, ring_id);
 
@@ -297,7 +346,7 @@ BKCLComm* BKCLCommContext::AssignBKCLComm(BKCLContext_t comm, int nranks,
     auto* dev_ctx = static_cast<platform::XPUDeviceContext*>(
         platform::DeviceContextPool::Instance().Get(
             platform::XPUPlace(dev_id)));
-    dev_ctx->set_bkcl_context(comm);
+    dev_ctx->SetBkclContext(comm);
   }
 
   return comm_map_[ring_id][dev_id].get();

@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include <ctime>
+
+#include "paddle/fluid/framework/convert_utils.h"
 #include "paddle/fluid/framework/data_type.h"
 #include "paddle/fluid/framework/device_worker.h"
 #include "paddle/fluid/operators/controlflow/conditional_block_op_helper.h"
@@ -20,7 +22,7 @@ limitations under the License. */
 #include "paddle/fluid/platform/lodtensor_printer.h"
 
 #if defined PADDLE_WITH_PSCORE
-#include "paddle/fluid/distributed/service/communicator.h"
+#include "paddle/fluid/distributed/ps/service/communicator/communicator.h"
 #endif
 
 namespace paddle {
@@ -79,11 +81,11 @@ void HogwildWorker::CreateThreadScope(const ProgramDesc &program) {
         LoDTensor *thread_tensor = ptr1->GetMutable<LoDTensor>();
         LoDTensor *root_tensor =
             root_scope_->FindVar(var->Name())->GetMutable<LoDTensor>();
-#define MemsetCallback(cpp_type, proto_type)                     \
-  do {                                                           \
-    if (root_tensor->type() == proto_type) {                     \
-      SetZero<cpp_type>(thread_tensor, root_tensor, tensor_dim); \
-    }                                                            \
+#define MemsetCallback(cpp_type, proto_type)                                  \
+  do {                                                                        \
+    if (framework::TransToProtoVarType(root_tensor->dtype()) == proto_type) { \
+      SetZero<cpp_type>(thread_tensor, root_tensor, tensor_dim);              \
+    }                                                                         \
   } while (0)
         _ForEachDataType_(MemsetCallback);
       }
@@ -150,6 +152,9 @@ void HogwildWorker::TrainFilesWithProfiler() {
       VLOG(3) << "Going to run op " << op_name[i];
       if (!need_skip) {
         ops_[i]->Run(*thread_scope_, place_);
+#ifdef PADDLE_WITH_HETERPS
+        dev_ctx_->Wait();
+#endif
       }
       VLOG(3) << "Op " << op_name[i] << " Finished";
       timeline.Pause();
@@ -167,6 +172,16 @@ void HogwildWorker::TrainFilesWithProfiler() {
     total_inst += cur_batch;
     ++batch_cnt;
     PrintFetchVars();
+#ifdef PADDLE_WITH_HETERPS
+    dev_ctx_->Wait();
+    VLOG(1) << "GpuPs worker " << thread_id_ << " train cost " << total_time
+            << " seconds, ins_num: " << total_inst;
+    for (size_t i = 0; i < op_name.size(); ++i) {
+      VLOG(1) << "card:" << thread_id_ << ", op: " << op_name[i]
+              << ", mean time: " << op_total_time[i] / total_inst
+              << "s, totol time:" << op_total_time[i] << "sec";
+    }
+#else
     if (thread_id_ == 0) {
       if (batch_cnt > 0 && batch_cnt % 100 == 0) {
         for (size_t i = 0; i < ops_.size(); ++i) {
@@ -178,6 +193,7 @@ void HogwildWorker::TrainFilesWithProfiler() {
         fprintf(stderr, "%6.2f instances/s\n", total_inst / total_time);
       }
     }
+#endif
     thread_scope_->DropKids();
     timeline.Start();
   }
@@ -195,10 +211,14 @@ void HogwildWorker::TrainFilesWithProfiler() {
 
 void HogwildWorker::TrainFiles() {
   platform::SetNumThreads(1);
+  platform::Timer timeline;
+  timeline.Start();
 
+  int total_ins_num = 0;
   // how to accumulate fetched values here
   device_reader_->Start();
   int cur_batch;
+  int batch_cnt = 0;
   while ((cur_batch = device_reader_->Next()) > 0) {
     for (auto &op : ops_) {
       bool need_skip = false;
@@ -213,9 +233,26 @@ void HogwildWorker::TrainFiles() {
       }
     }
 
+    if (need_dump_field_) {
+      DumpField(*thread_scope_, dump_mode_, dump_interval_);
+    }
+    if (need_dump_param_ && thread_id_ == 0) {
+      DumpParam(*thread_scope_, batch_cnt);
+    }
+
+    total_ins_num += cur_batch;
+    ++batch_cnt;
     PrintFetchVars();
     thread_scope_->DropKids();
   }
+  timeline.Pause();
+  VLOG(3) << "worker " << thread_id_ << " train cost " << timeline.ElapsedSec()
+          << " seconds, ins_num: " << total_ins_num;
+
+  if (need_dump_field_ || need_dump_param_) {
+    writer_.Flush();
+  }
+
 #if defined PADDLE_WITH_PSCORE
   if (thread_barrier_) {
     paddle::distributed::Communicator::GetInstance()->BarrierTriggerDecrement();

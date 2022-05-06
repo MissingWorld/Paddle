@@ -12,14 +12,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-#include "paddle/fluid/operators/gather_op.h"
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/framework/tensor_util.h"
-#include "paddle/fluid/operators/kron_op.h"
-#include "paddle/fluid/operators/npu_op_runner.h"
-#include "paddle/fluid/platform/npu_info.h"
+#include "paddle/fluid/platform/device/npu/npu_info.h"
+#include "paddle/fluid/platform/device/npu/npu_op_runner.h"
 
 namespace paddle {
 namespace operators {
@@ -33,8 +33,8 @@ class GatherOpNPUKernel : public framework::OpKernel<T> {
     auto *out = ctx.Output<Tensor>("Out");
 
     out->mutable_data<T>(ctx.GetPlace());
-    auto runner = NpuOpRunner("Gather", {*x, *index}, {*out},
-                              {{"validate_indices", true}});
+    const auto &runner = NpuOpRunner("Gather", {*x, *index}, {*out},
+                                     {{"validate_indices", true}});
     auto stream =
         ctx.template device_context<paddle::platform::NPUDeviceContext>()
             .stream();
@@ -58,7 +58,7 @@ class GatherGradOpNPUKernel : public framework::OpKernel<T> {
     if (index_dims.size() == 1) {
       tmp_tensor.ShareDataWith(*index);
       std::vector<int64_t> new_dim = {index_dims[0], 1};
-      tmp_tensor.Resize(framework::make_ddim(new_dim));
+      tmp_tensor.Resize(phi::make_ddim(new_dim));
       index = &tmp_tensor;
     }
 
@@ -75,7 +75,7 @@ class GatherGradOpNPUKernel : public framework::OpKernel<T> {
                              zeroslike_xout.numel() * sizeof(T), stream);
 
     // step3: scatter(x_grad)
-    auto runner_scatter = NpuOpRunner(
+    const auto &runner_scatter = NpuOpRunner(
         "TensorScatterUpdate", {zeroslike_xout, *index, *dout}, {*dx}, {});
     runner_scatter.Run(stream);
   }

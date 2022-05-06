@@ -17,8 +17,9 @@ import warnings
 import paddle.nn as nn
 import numpy as np
 from .static_flops import static_flops, Table
+from paddle.fluid.dygraph.dygraph_to_static.program_translator import unwrap_decorators
 
-__all__ = ['flops']
+__all__ = []
 
 
 def flops(net, input_size, custom_ops=None, print_detail=False):
@@ -100,6 +101,10 @@ def flops(net, input_size, custom_ops=None, print_detail=False):
             #Total Flops: 347560     Total Params: 61610
     """
     if isinstance(net, nn.Layer):
+        # If net is a dy2stat model, net.forward is StaticFunction instance,
+        # we set net.forward to original forward function.
+        _, net.forward = unwrap_decorators(net.forward)
+
         inputs = paddle.randn(input_size)
         return dynamic_flops(
             net,
@@ -176,7 +181,10 @@ def count_parameters(m, x, y):
 
 def count_io_info(m, x, y):
     m.register_buffer('input_shape', paddle.to_tensor(x[0].shape))
-    m.register_buffer('output_shape', paddle.to_tensor(y.shape))
+    if isinstance(y, (list, tuple)):
+        m.register_buffer('output_shape', paddle.to_tensor(y[0].shape))
+    else:
+        m.register_buffer('output_shape', paddle.to_tensor(y.shape))
 
 
 register_hooks = {
@@ -211,8 +219,8 @@ def dynamic_flops(model, inputs, custom_ops=None, print_detail=False):
     def add_hooks(m):
         if len(list(m.children())) > 0:
             return
-        m.register_buffer('total_ops', paddle.zeros([1], dtype='int32'))
-        m.register_buffer('total_params', paddle.zeros([1], dtype='int32'))
+        m.register_buffer('total_ops', paddle.zeros([1], dtype='int64'))
+        m.register_buffer('total_params', paddle.zeros([1], dtype='int64'))
         m_type = type(m)
 
         flops_fn = None
@@ -253,8 +261,8 @@ def dynamic_flops(model, inputs, custom_ops=None, print_detail=False):
     for m in model.sublayers():
         if len(list(m.children())) > 0:
             continue
-        if set(['total_ops', 'total_params', 'input_shape',
-                'output_shape']).issubset(set(list(m._buffers.keys()))):
+        if {'total_ops', 'total_params', 'input_shape',
+                'output_shape'}.issubset(set(list(m._buffers.keys()))):
             total_ops += m.total_ops
             total_params += m.total_params
 
@@ -269,8 +277,8 @@ def dynamic_flops(model, inputs, custom_ops=None, print_detail=False):
     for n, m in model.named_sublayers():
         if len(list(m.children())) > 0:
             continue
-        if set(['total_ops', 'total_params', 'input_shape',
-                'output_shape']).issubset(set(list(m._buffers.keys()))):
+        if {'total_ops', 'total_params', 'input_shape',
+                'output_shape'}.issubset(set(list(m._buffers.keys()))):
             table.add_row([
                 m.full_name(), list(m.input_shape.numpy()),
                 list(m.output_shape.numpy()), int(m.total_params),

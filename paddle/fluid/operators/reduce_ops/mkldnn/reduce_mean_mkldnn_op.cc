@@ -30,7 +30,7 @@ class ReduceMeanGradMKLDNNKernel : public ReduceGradMKLDNNKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& ctx) const override {
     const auto* input_x = ctx.Input<Tensor>("X");
-    auto input_dims = framework::vectorize(input_x->dims());
+    auto input_dims = phi::vectorize(input_x->dims());
     auto reduce_dims = ctx.Attr<std::vector<int>>("dim");
 
     int number_of_elements = 1;
@@ -45,7 +45,8 @@ class ReduceMeanGradMKLDNNKernel : public ReduceGradMKLDNNKernel<T> {
       number_of_elements = input_x->numel();
     }
 
-    this->RunKernel(ctx, dnnl::algorithm::binary_add, 0.0f,
+    this->RunKernel(ctx, dnnl::algorithm::binary_add,
+                    dnnl::algorithm::reduction_mean, 0.0f,
                     1.0L / number_of_elements);
   }
 };

@@ -20,6 +20,7 @@ import numpy as np
 import paddle
 import paddle.fluid.dygraph as dg
 from op_test import OpTest
+from paddle.fluid.framework import _test_eager_guard
 
 
 class TestTensorBackward(unittest.TestCase):
@@ -29,7 +30,7 @@ class TestTensorBackward(unittest.TestCase):
         if paddle.is_compiled_with_cuda():
             self._places.append(paddle.CUDAPlace(0))
 
-    def test_tensor_backward(self):
+    def func_tensor_backward(self):
         for dtype in self._dtypes:
             x = np.random.random([2, 100]).astype(dtype)
             y = np.random.random([100, 2]).astype(dtype)
@@ -46,7 +47,12 @@ class TestTensorBackward(unittest.TestCase):
 
                     x_grad = np.matmul(grad, y.T)
 
-                    self.assertTrue(np.allclose(x_grad, x_tensor.grad))
+                    self.assertTrue(np.allclose(x_grad, x_tensor.grad.numpy()))
+
+    def test_tensor_backward(self):
+        with _test_eager_guard():
+            self.func_tensor_backward()
+        self.func_tensor_backward()
 
 
 class TestBackwardAPI(unittest.TestCase):
@@ -56,7 +62,7 @@ class TestBackwardAPI(unittest.TestCase):
         if paddle.is_compiled_with_cuda():
             self._places.append(paddle.CUDAPlace(0))
 
-    def test_backward_api(self):
+    def func_backward_api(self):
         for dtype in self._dtypes:
             x = np.random.random([2, 2]).astype(dtype)
             y = np.random.random([2, 2]).astype(dtype)
@@ -75,9 +81,15 @@ class TestBackwardAPI(unittest.TestCase):
 
                     x_grad = np.matmul(grad, y.T)
 
-                    self.assertTrue(np.allclose(x_grad * 2, x_tensor.grad))
+                    self.assertTrue(
+                        np.allclose(x_grad * 2, x_tensor.grad.numpy()))
 
-    def test_backward_single_tensor(self):
+    def test_backward_api(self):
+        with _test_eager_guard():
+            self.func_backward_api()
+        self.func_backward_api()
+
+    def func_backward_single_tensor(self):
         for dtype in self._dtypes:
             x = np.random.random([2, 2]).astype(dtype)
             y = np.random.random([2, 2]).astype(dtype)
@@ -94,9 +106,14 @@ class TestBackwardAPI(unittest.TestCase):
 
                     x_grad = np.matmul(grad, y.T)
 
-                    self.assertTrue(np.allclose(x_grad, x_tensor.grad))
+                    self.assertTrue(np.allclose(x_grad, x_tensor.grad.numpy()))
 
-    def test_backward_none_grad_tensor(self):
+    def test_backward_single_tensor(self):
+        with _test_eager_guard():
+            self.func_backward_single_tensor()
+        self.func_backward_single_tensor()
+
+    def func_backward_none_grad_tensor(self):
         for dtype in self._dtypes:
             x = np.random.random([2, 2]).astype(dtype)
             y = np.random.random([2, 2]).astype(dtype)
@@ -112,7 +129,40 @@ class TestBackwardAPI(unittest.TestCase):
 
                     x_grad = np.matmul(grad, y.T)
 
-                    self.assertTrue(np.allclose(x_grad, x_tensor.grad))
+                    self.assertTrue(np.allclose(x_grad, x_tensor.grad.numpy()))
+
+    def test_backward_none_grad_tensor(self):
+        with _test_eager_guard():
+            self.func_backward_none_grad_tensor()
+        self.func_backward_none_grad_tensor()
+
+    def func_backward_accumulator_with_init_grad(self):
+        for dtype in self._dtypes:
+            x = np.random.random([10, ]).astype(dtype)
+            y_grad = np.random.random([10, ]).astype(dtype)
+            z_grad = np.random.random([10, ]).astype(dtype)
+            self._places = [paddle.CPUPlace()]
+            for place in self._places:
+                with dg.guard(place):
+                    x_tensor = paddle.to_tensor(x, stop_gradient=False)
+                    y_tensor = x_tensor**2
+                    z_tensor = y_tensor**3
+
+                    y_grad_tensor = paddle.to_tensor(y_grad)
+                    z_grad_tensor = paddle.to_tensor(z_grad)
+                    paddle.autograd.backward([y_tensor, z_tensor],
+                                             [y_grad_tensor, z_grad_tensor])
+
+                    y = x**2
+                    z = x**3
+                    x_grad = 2 * x * (y_grad + 3 * y * y * z_grad)
+
+                    self.assertTrue(np.allclose(x_grad, x_tensor.grad.numpy()))
+
+    def test_backward_accumulator_with_init_grad(self):
+        with _test_eager_guard():
+            self.func_backward_accumulator_with_init_grad()
+        self.func_backward_accumulator_with_init_grad()
 
 
 if __name__ == '__main__':

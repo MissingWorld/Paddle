@@ -15,8 +15,8 @@ limitations under the License. */
 #include <memory>
 #include <string>
 
-#include "paddle/fluid/operators/elementwise/elementwise_sub_op.h"
-#include "paddle/fluid/operators/npu_op_runner.h"
+#include "paddle/fluid/operators/elementwise/elementwise_op.h"
+#include "paddle/fluid/platform/device/npu/npu_op_runner.h"
 
 namespace paddle {
 namespace operators {
@@ -33,7 +33,7 @@ class ElementwiseSubNPUKernel : public framework::OpKernel<T> {
 
     out->mutable_data<T>(ctx.GetPlace());
 
-    auto runner = NpuOpRunner("Sub", {*x, *y}, {*out}, {});
+    const auto& runner = NpuOpRunner("Sub", {*x, *y}, {*out}, {});
 
     auto stream =
         ctx.template device_context<paddle::platform::NPUDeviceContext>()
@@ -82,10 +82,11 @@ class ElementwiseSubGradNPUKernel : public framework::OpKernel<T> {
         for (auto i = reduce_ndim; i < dout->dims().size(); ++i) {
           reduced_dout_dims.push_back(dout->dims()[i]);
         }
-        reduced_dout.Resize(framework::make_ddim(reduced_dout_dims));
+        reduced_dout.Resize(phi::make_ddim(reduced_dout_dims));
         reduced_dout.mutable_data<T>(ctx.GetPlace());
-        auto runner = NpuOpRunner("ReduceSumD", {*dout}, {reduced_dout},
-                                  {{"axes", axes}, {"keep_dims", false}});
+        const auto& runner =
+            NpuOpRunner("ReduceSumD", {*dout}, {reduced_dout},
+                        {{"axes", axes}, {"keep_dims", false}});
         runner.Run(stream);
         tmp_dout = &reduced_dout;
       }
@@ -98,8 +99,8 @@ class ElementwiseSubGradNPUKernel : public framework::OpKernel<T> {
         }
       }
       if (axes.size() != 0) {
-        auto runner = NpuOpRunner("ReduceSumD", {*tmp_dout}, {*dx},
-                                  {{"axes", axes}, {"keep_dims", true}});
+        const auto& runner = NpuOpRunner("ReduceSumD", {*tmp_dout}, {*dx},
+                                         {{"axes", axes}, {"keep_dims", true}});
         runner.Run(stream);
       } else {
         framework::TensorCopy(
@@ -125,10 +126,11 @@ class ElementwiseSubGradNPUKernel : public framework::OpKernel<T> {
         for (auto i = reduce_ndim; i < dout->dims().size(); ++i) {
           reduced_dout_dims.push_back(dout->dims()[i]);
         }
-        reduced_dout.Resize(framework::make_ddim(reduced_dout_dims));
+        reduced_dout.Resize(phi::make_ddim(reduced_dout_dims));
         reduced_dout.mutable_data<T>(ctx.GetPlace());
-        auto runner = NpuOpRunner("ReduceSumD", {*dout}, {reduced_dout},
-                                  {{"axes", axes}, {"keep_dims", false}});
+        const auto& runner =
+            NpuOpRunner("ReduceSumD", {*dout}, {reduced_dout},
+                        {{"axes", axes}, {"keep_dims", false}});
         runner.Run(stream);
         tmp_dout = &reduced_dout;
       }
@@ -144,14 +146,15 @@ class ElementwiseSubGradNPUKernel : public framework::OpKernel<T> {
       if (axes.size() != 0) {
         reduced_dy.Resize(dy->dims());
         reduced_dy.mutable_data<T>(ctx.GetPlace());
-        auto runner = NpuOpRunner("ReduceSumD", {*tmp_dout}, {reduced_dy},
-                                  {{"axes", axes}, {"keep_dims", true}});
+        const auto& runner =
+            NpuOpRunner("ReduceSumD", {*tmp_dout}, {reduced_dy},
+                        {{"axes", axes}, {"keep_dims", true}});
         runner.Run(stream);
         tmp_dy = &reduced_dy;
       }
 
       // stage 3, negative
-      auto runner = NpuOpRunner("Neg", {*tmp_dy}, {*dy}, {});
+      const auto& runner = NpuOpRunner("Neg", {*tmp_dy}, {*dy}, {});
       runner.Run(stream);
     }
   }
@@ -163,9 +166,17 @@ class ElementwiseSubGradNPUKernel : public framework::OpKernel<T> {
 namespace ops = paddle::operators;
 namespace plat = paddle::platform;
 
-REGISTER_OP_NPU_KERNEL(elementwise_sub, ops::ElementwiseSubNPUKernel<float>,
+REGISTER_OP_NPU_KERNEL(elementwise_sub, ops::ElementwiseSubNPUKernel<int>,
+#ifdef PADDLE_WITH_ASCEND_INT64
+                       ops::ElementwiseSubNPUKernel<int64_t>,
+#endif
+                       ops::ElementwiseSubNPUKernel<float>,
                        ops::ElementwiseSubNPUKernel<plat::float16>);
 
 REGISTER_OP_NPU_KERNEL(elementwise_sub_grad,
+                       ops::ElementwiseSubGradNPUKernel<int>,
+#ifdef PADDLE_WITH_ASCEND_INT64
+                       ops::ElementwiseSubGradNPUKernel<int64_t>,
+#endif
                        ops::ElementwiseSubGradNPUKernel<float>,
                        ops::ElementwiseSubGradNPUKernel<plat::float16>);

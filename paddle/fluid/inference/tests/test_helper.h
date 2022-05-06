@@ -22,8 +22,8 @@ limitations under the License. */
 #include "paddle/fluid/framework/lod_tensor.h"
 #include "paddle/fluid/inference/io.h"
 #include "paddle/fluid/platform/errors.h"
-#include "paddle/fluid/platform/port.h"
 #include "paddle/fluid/platform/profiler.h"
+#include "paddle/phi/backends/dynload/port.h"
 
 DECLARE_bool(use_mkldnn);
 
@@ -33,6 +33,9 @@ bool gpu_place_used(const paddle::PaddlePlace& place) {
 }
 bool xpu_place_used(const paddle::PaddlePlace& place) {
   return place == paddle::PaddlePlace::kXPU;
+}
+bool npu_place_used(const paddle::PaddlePlace& place) {
+  return place == paddle::PaddlePlace::kNPU;
 }
 bool cpu_place_used(const paddle::PaddlePlace& place) {
   return place == paddle::PaddlePlace::kCPU;
@@ -55,7 +58,7 @@ void SetupTensor(paddle::framework::LoDTensor* input,
 template <typename T>
 void SetupTensor(paddle::framework::LoDTensor* input,
                  paddle::framework::DDim dims, const std::vector<T>& data) {
-  CHECK_EQ(paddle::framework::product(dims), static_cast<int64_t>(data.size()));
+  CHECK_EQ(phi::product(dims), static_cast<int64_t>(data.size()));
   T* input_ptr = input->mutable_data<T>(dims, paddle::platform::CPUPlace());
   memcpy(input_ptr, data.data(), input->numel() * sizeof(T));
 }

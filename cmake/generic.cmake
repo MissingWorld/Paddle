@@ -92,7 +92,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 # including io directory for inference lib paddle_api.h
 include_directories("${PADDLE_SOURCE_DIR}/paddle/fluid/framework/io")
 
-if(NOT APPLE)
+if(NOT APPLE AND NOT WIN32)
   find_package(Threads REQUIRED)
   link_libraries(${CMAKE_THREAD_LIBS_INIT})
   if(WITH_PSLIB OR WITH_DISTRIBUTE)
@@ -100,7 +100,7 @@ if(NOT APPLE)
   else()
     set(CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE} -pthread -ldl -lrt")
   endif()
-endif(NOT APPLE)
+endif()
 
 set_property(GLOBAL PROPERTY FLUID_MODULES "")
 # find all fluid modules is used for paddle fluid static library
@@ -115,6 +115,20 @@ function(find_fluid_modules TARGET_NAME)
     set_property(GLOBAL PROPERTY FLUID_MODULES "${fluid_modules}")
   endif()
 endfunction(find_fluid_modules)
+
+set_property(GLOBAL PROPERTY PHI_MODULES "")
+# find all phi modules is used for paddle static library
+# for building inference libs
+function(find_phi_modules TARGET_NAME)
+  get_filename_component(__target_path ${TARGET_NAME} ABSOLUTE)
+  string(REGEX REPLACE "^${PADDLE_SOURCE_DIR}/" "" __target_path ${__target_path})
+  string(FIND "${__target_path}" "phi" pos)
+  if(pos GREATER 1)
+    get_property(phi_modules GLOBAL PROPERTY PHI_MODULES)
+    set(phi_modules ${phi_modules} ${TARGET_NAME})
+    set_property(GLOBAL PROPERTY PHI_MODULES "${phi_modules}")
+  endif()
+endfunction(find_phi_modules)
 
 function(common_link TARGET_NAME)
   if (WITH_PROFILER)
@@ -162,6 +176,36 @@ function(create_static_lib TARGET_NAME)
   endif()
 endfunction()
 
+function(create_dummy_static_lib TARGET_NAME)
+  set(options "")
+  set(oneValueArgs "")
+  set(multiValueArgs LIBS DEPS LIMIT)
+  cmake_parse_arguments(merge "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+  list(REMOVE_DUPLICATES merge_LIBS)
+  set(index 1)
+  set(offset 1)
+  # the dummy target would be consisted of limit size libraries
+  set(limit ${merge_LIMIT})
+  list(LENGTH merge_LIBS libs_len)
+  foreach(lib ${merge_LIBS})
+    list(APPEND merge_list ${lib})
+    list(LENGTH merge_list listlen)
+    if ((${listlen} GREATER ${limit}) OR (${offset} EQUAL ${libs_len}))
+      message("Merge and generate static library: ${TARGET_NAME}_static_${index}")
+      merge_static_libs(${TARGET_NAME}_static_${index} ${merge_list})
+      if(merge_DEPS)
+        target_link_libraries(${TARGET_NAME}_static_${index} ${merge_DEPS})
+      endif()
+      set(merge_list)
+      list(APPEND ${TARGET_NAME}_list ${TARGET_NAME}_static_${index})
+      MATH(EXPR index "${index}+1")
+    endif()
+    MATH(EXPR offset "${offset}+1")
+  endforeach()
+  cc_library(${TARGET_NAME} DEPS ${${TARGET_NAME}_list})
+endfunction()
+
 function(merge_static_libs TARGET_NAME)
   set(libs ${ARGN})
   list(REMOVE_DUPLICATES libs)
@@ -179,92 +223,61 @@ function(merge_static_libs TARGET_NAME)
   # also help to track dependencies.
   set(target_SRCS ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_NAME}_dummy.c)
 
-  if(APPLE) # Use OSX's libtool to merge archives
-    # Make the generated dummy source file depended on all static input
-    # libs. If input lib changes,the source file is touched
-    # which causes the desired effect (relink).
-    add_custom_command(OUTPUT ${target_SRCS}
-      COMMAND ${CMAKE_COMMAND} -E touch ${target_SRCS}
-      DEPENDS ${libs})
+  # Make the generated dummy source file depended on all static input
+  # libs. If input lib changes,the source file is touched
+  # which causes the desired effect (relink).
+  add_custom_command(OUTPUT ${target_SRCS}
+    COMMAND ${CMAKE_COMMAND} -E touch ${target_SRCS}
+    DEPENDS ${libs})
+  
+    # Generate dummy staic lib
+  generate_dummy_static_lib(LIB_NAME ${TARGET_NAME} FILE_PATH ${target_SRCS} GENERATOR "generic.cmake:merge_static_libs")
+  target_link_libraries(${TARGET_NAME} ${libs_deps})
 
-    # Generate dummy static lib
-    generate_dummy_static_lib(LIB_NAME ${TARGET_NAME} FILE_PATH ${target_SRCS} GENERATOR "generic.cmake:merge_static_libs")
-
-    target_link_libraries(${TARGET_NAME} ${libs_deps})
-
+  # OSX: use 'libtool' to merge archives
+  if(APPLE)
     foreach(lib ${libs})
       # Get the file names of the libraries to be merged
       set(libfiles ${libfiles} $<TARGET_FILE:${lib}>)
     endforeach()
     add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+      COMMENT "Merge and generate static lib: lib${TARGET_NAME}.a"
       COMMAND rm "${CMAKE_CURRENT_BINARY_DIR}/lib${TARGET_NAME}.a"
       COMMAND /usr/bin/libtool -static -o "${CMAKE_CURRENT_BINARY_DIR}/lib${TARGET_NAME}.a" ${libfiles}
       )
-  endif(APPLE)
-  if(LINUX) # general UNIX: use "ar" to extract objects and re-add to a common lib
-    set(target_DIR ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_NAME}.dir)
+  endif()
+
+  # LINUX: use "ar" to extract objects and re-add to a common lib
+  if(LINUX)
+    set(mri_file ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_NAME}.mri CACHE INTERNAL "phi_static.mri file")
+    get_property(ABS_MERGE_LIB_PATH TARGET ${TARGET_NAME} PROPERTY LOCATION)
+    file(WRITE ${mri_file} "create ${ABS_MERGE_LIB_PATH}\n")
 
     foreach(lib ${libs})
-      set(objlistfile ${target_DIR}/${lib}.objlist) # list of objects in the input library
-      set(objdir ${target_DIR}/${lib}.objdir)
-
-      add_custom_command(OUTPUT ${objdir}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${objdir}
-        DEPENDS ${lib})
-
-      add_custom_command(OUTPUT ${objlistfile}
-        COMMAND ${CMAKE_AR} -x "$<TARGET_FILE:${lib}>"
-        COMMAND ${CMAKE_AR} -t "$<TARGET_FILE:${lib}>" > ${objlistfile}
-        DEPENDS ${lib} ${objdir}
-        WORKING_DIRECTORY ${objdir})
-
-      list(APPEND target_OBJS "${objlistfile}")
+      get_property(ABS_LIB_PATH TARGET ${lib} PROPERTY LOCATION)
+      file(APPEND ${mri_file} "addlib ${ABS_LIB_PATH}\n")
     endforeach()
-
-    # Make the generated dummy source file depended on all static input
-    # libs. If input lib changes,the source file is touched
-    # which causes the desired effect (relink).
-    add_custom_command(OUTPUT ${target_SRCS}
-      COMMAND ${CMAKE_COMMAND} -E touch ${target_SRCS}
-      DEPENDS ${libs} ${target_OBJS})
-
-    # Generate dummy staic lib
-    generate_dummy_static_lib(LIB_NAME ${TARGET_NAME} FILE_PATH ${target_SRCS} GENERATOR "generic.cmake:merge_static_libs")
-
-    target_link_libraries(${TARGET_NAME} ${libs_deps})
-
-    # Get the file name of the generated library
-    set(target_LIBNAME "$<TARGET_FILE:${TARGET_NAME}>")
+    file(APPEND ${mri_file} "save\nend\n")
 
     add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-        COMMAND ${CMAKE_AR} crs ${target_LIBNAME} `find ${target_DIR} -name '*.o'`
-        COMMAND ${CMAKE_RANLIB} ${target_LIBNAME}
-        WORKING_DIRECTORY ${target_DIR})
-  endif(LINUX)
-  if(WIN32) # windows do not support gcc/nvcc combined compiling. Use msvc lib.exe to merge libs.
-    # Make the generated dummy source file depended on all static input
-    # libs. If input lib changes,the source file is touched
-    # which causes the desired effect (relink).
-    add_custom_command(OUTPUT ${target_SRCS}
-      COMMAND ${CMAKE_COMMAND} -E touch ${target_SRCS}
-      DEPENDS ${libs})
-    # Generate dummy staic lib
-    generate_dummy_static_lib(LIB_NAME ${TARGET_NAME} FILE_PATH ${target_SRCS} GENERATOR "generic.cmake:merge_static_libs")
+        COMMENT "Merge and generate static lib: lib${TARGET_NAME}.a"
+        COMMAND ${CMAKE_AR} -M < ${mri_file}
+        COMMAND ${CMAKE_RANLIB} "$<TARGET_FILE:${TARGET_NAME}>")
+  endif()
 
-    target_link_libraries(${TARGET_NAME} ${libs_deps})
-
+  # Windows do not support gcc/nvcc combined compiling. Use msvc 'lib.exe' to merge libs.
+  if(WIN32)
     foreach(lib ${libs})
-      # Get the file names of the libraries to be merged
       set(libfiles ${libfiles} $<TARGET_FILE:${lib}>)
     endforeach()
-    # msvc will put libarary in directory of "/Release/xxxlib" by default
-    #       COMMAND cmake -E remove "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_BUILD_TYPE}/${TARGET_NAME}.lib"
+    # msvc compiler will put libarary in directory of "/Release/xxxlib" by default
     add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+      COMMENT "Merge and generate static lib: lib${TARGET_NAME}.lib"
       COMMAND cmake -E make_directory $<TARGET_FILE_DIR:${TARGET_NAME}>
       COMMAND lib /OUT:$<TARGET_FILE:${TARGET_NAME}> ${libfiles}
       )
-  endif(WIN32)
-endfunction(merge_static_libs)
+  endif()
+endfunction()
 
 function(check_coverage_opt TARGET_NAME SRCS)
   if(WITH_COVERAGE AND WITH_INCREMENTAL_COVERAGE)
@@ -310,6 +323,7 @@ function(cc_library TARGET_NAME)
       else()
         add_library(${TARGET_NAME} STATIC ${cc_library_SRCS})
         find_fluid_modules(${TARGET_NAME})
+        find_phi_modules(${TARGET_NAME})
       endif()
     if(cc_library_DEPS)
       # Don't need link libwarpctc.so
@@ -391,7 +405,7 @@ function(cc_binary TARGET_NAME)
 endfunction(cc_binary)
 
 function(cc_test_build TARGET_NAME)
-  if(WITH_TESTING)
+  if(WITH_TESTING AND NOT "$ENV{CI_SKIP_CPP_TEST}" STREQUAL "ON")
     set(oneValueArgs "")
     set(multiValueArgs SRCS DEPS)
     cmake_parse_arguments(cc_test "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -409,14 +423,12 @@ function(cc_test_build TARGET_NAME)
     if(WITH_ROCM)
       target_link_libraries(${TARGET_NAME} ${ROCM_HIPRTC_LIB})
     endif()
+    check_coverage_opt(${TARGET_NAME} ${cc_test_SRCS})
   endif()
-
-  check_coverage_opt(${TARGET_NAME} ${cc_test_SRCS})
-
 endfunction()
 
 function(cc_test_run TARGET_NAME)
-  if(WITH_TESTING)
+  if(WITH_TESTING AND NOT "$ENV{CI_SKIP_CPP_TEST}" STREQUAL "ON")
     set(oneValueArgs "")
     set(multiValueArgs COMMAND ARGS)
     cmake_parse_arguments(cc_test "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -433,6 +445,8 @@ function(cc_test_run TARGET_NAME)
     if (APPLE)
         set_tests_properties(${TARGET_NAME} PROPERTIES TIMEOUT 20)
     endif()
+  elseif(WITH_TESTING AND NOT TEST ${TARGET_NAME})
+    add_test(NAME ${TARGET_NAME} COMMAND ${CMAKE_COMMAND} -E echo CI skip ${TARGET_NAME}.)
   endif()
 endfunction()
 
@@ -461,6 +475,8 @@ function(cc_test TARGET_NAME)
         COMMAND ${TARGET_NAME}
         ARGS ${cc_test_ARGS})
     endif()
+  elseif(WITH_TESTING AND NOT TEST ${TARGET_NAME})
+    add_test(NAME ${TARGET_NAME} COMMAND ${CMAKE_COMMAND} -E echo CI skip ${TARGET_NAME}.)
   endif()
 endfunction(cc_test)
 
@@ -480,6 +496,7 @@ function(nv_library TARGET_NAME)
       else()
         add_library(${TARGET_NAME} STATIC ${nv_library_SRCS})
         find_fluid_modules(${TARGET_NAME})
+        find_phi_modules(${TARGET_NAME})
       endif()
       if (nv_library_DEPS)
         add_dependencies(${TARGET_NAME} ${nv_library_DEPS})
@@ -562,14 +579,15 @@ function(hip_library TARGET_NAME)
     cmake_parse_arguments(hip_library "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
     if(hip_library_SRCS)
       # FindHIP.cmake defined hip_add_library, HIP_SOURCE_PROPERTY_FORMAT is requried if no .cu files found
-      if(NOT ${CMAKE_CURRENT_SOURCE_DIR} MATCHES ".*/operators")
-        set_source_files_properties(${hip_library_SRCS} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+      if(NOT (${CMAKE_CURRENT_SOURCE_DIR} MATCHES ".*/operators" OR ${CMAKE_CURRENT_SOURCE_DIR} MATCHES ".*/phi/kernels"))
+       set_source_files_properties(${hip_library_SRCS} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
       endif()
       if (hip_library_SHARED OR hip_library_shared) # build *.so
         hip_add_library(${TARGET_NAME} SHARED ${hip_library_SRCS})
       else()
         hip_add_library(${TARGET_NAME} STATIC ${hip_library_SRCS})
         find_fluid_modules(${TARGET_NAME})
+        find_phi_modules(${TARGET_NAME})
       endif()
       if (hip_library_DEPS)
         add_dependencies(${TARGET_NAME} ${hip_library_DEPS})
@@ -632,8 +650,85 @@ function(hip_test TARGET_NAME)
     set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_cpu_deterministic=true)
     set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_init_allocated_mem=true)
     set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_cudnn_deterministic=true)
+    set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/python/paddle/libs:$LD_LIBRARY_PATH")
   endif()
 endfunction(hip_test)
+
+function(xpu_library TARGET_NAME)
+  if (WITH_XPU_KP)
+    set(options STATIC static SHARED shared)
+    set(oneValueArgs "")
+    set(multiValueArgs SRCS DEPS)
+    cmake_parse_arguments(xpu_library "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    if(xpu_library_SRCS)
+      if (xpu_library_SHARED OR xpu_library_shared) # build *.so
+        message(FATAL_ERROR "XPU kernel currently does not support dynamic links")
+      else()
+        xpu_add_library(${TARGET_NAME} STATIC ${xpu_library_SRCS} DEPENDS ${xpu_library_DEPS})
+        find_fluid_modules(${TARGET_NAME})
+        find_phi_modules(${TARGET_NAME})
+      endif()
+      if (xpu_library_DEPS)
+        add_dependencies(${TARGET_NAME} ${xpu_library_DEPS})
+        target_link_libraries(${TARGET_NAME} ${xpu_library_DEPS})
+      endif()
+      # cpplint code style
+      foreach(source_file ${xpu_library_SRCS})
+        string(REGEX REPLACE "\\.[^.]*$" "" source ${source_file})
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${source}.h)
+          list(APPEND xpu_library_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/${source}.h)
+        endif()
+      endforeach()
+    else(xpu_library_SRCS)
+      if (xpu_library_DEPS)
+        list(REMOVE_DUPLICATES xpu_library_DEPS)
+        generate_dummy_static_lib(LIB_NAME ${TARGET_NAME} FILE_PATH ${target_SRCS} GENERATOR "generic.cmake:xpu_library")
+        target_link_libraries(${TARGET_NAME} ${xpu_library_DEPS})
+        add_dependencies(${TARGET_NAME} ${xpu_library_DEPS})
+      else()
+        message(FATAL "Please specify source file or library in xpu_library.")
+      endif()
+    endif(xpu_library_SRCS)
+  endif()
+endfunction(xpu_library)
+
+function(xpu_binary TARGET_NAME)
+  if (WITH_XPU_KP)
+    set(options "")
+    set(oneValueArgs "")
+    set(multiValueArgs SRCS DEPS)
+    cmake_parse_arguments(xpu_binary "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+    add_executable(${TARGET_NAME} ${xpu_binary_SRCS})
+    if(xpu_binary_DEPS)
+      target_link_libraries(${TARGET_NAME} ${xpu_binary_DEPS})
+      add_dependencies(${TARGET_NAME} ${xpu_binary_DEPS})
+      common_link(${TARGET_NAME})
+    endif()
+  endif()
+endfunction(xpu_binary)
+
+function(xpu_test TARGET_NAME)
+  # The environment variable `CI_SKIP_CPP_TEST` is used to skip the compilation
+  # and execution of test in CI. `CI_SKIP_CPP_TEST` is set to ON when no files
+  # other than *.py are modified.
+  if (WITH_XPU_KP AND WITH_TESTING AND NOT "$ENV{CI_SKIP_CPP_TEST}" STREQUAL "ON")
+    set(oneValueArgs "")
+    set(multiValueArgs SRCS DEPS)
+    cmake_parse_arguments(xpu_test "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+    add_executable(${TARGET_NAME} ${xpu_test_SRCS})
+    # "-pthread -ldl -lrt" is defined in CMAKE_CXX_LINK_EXECUTABLE
+    target_link_options(${TARGET_NAME} PRIVATE -pthread -ldl -lrt)
+    get_property(os_dependency_modules GLOBAL PROPERTY OS_DEPENDENCY_MODULES)
+    target_link_libraries(${TARGET_NAME} ${xpu_test_DEPS} paddle_gtest_main lod_tensor memory gtest gflags glog ${os_dependency_modules})
+    add_dependencies(${TARGET_NAME} ${xpu_test_DEPS} paddle_gtest_main lod_tensor memory gtest gflags glog)
+    common_link(${TARGET_NAME})
+    add_test(${TARGET_NAME} ${TARGET_NAME})
+    set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_cpu_deterministic=true)
+    set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_init_allocated_mem=true)
+    set_property(TEST ${TARGET_NAME} PROPERTY ENVIRONMENT FLAGS_cudnn_deterministic=true)
+  endif()
+endfunction(xpu_test)
 
 function(go_library TARGET_NAME)
   set(options STATIC static SHARED shared)
@@ -934,15 +1029,49 @@ function(generate_dummy_static_lib)
   if(NOT dummy_GENERATOR)
     message(FATAL_ERROR "You must provide a generator file name.")
   endif()
-  # if ${dummy_GENERATOR} contains "/", it may be a file path
-  if(NOT ${dummy_GENERATOR} MATCHES ".*/.*")
-    set(dummy_GENERATOR "${CMAKE_CURRENT_LIST_DIR}/${dummy_GENERATOR}")
-  endif()
   if(NOT dummy_CONTENT)
-    set(dummy_CONTENT "${dummy_FILE_PATH} for lib ${dummy_LIB_NAME}")
+    set(dummy_CONTENT "${dummy_LIB_NAME}_dummy.c for lib ${dummy_LIB_NAME}")
   endif()
 
   configure_file(${PROJECT_SOURCE_DIR}/cmake/dummy.c.in ${dummy_FILE_PATH} @ONLY)
   add_library(${dummy_LIB_NAME} STATIC ${dummy_FILE_PATH})
 endfunction()
 
+function(math_library TARGET)
+    # math_library is a function to create math library.
+    # The interface is the same as cc_library.
+    # But it handle split GPU/CPU code and link some common library.
+    set(cc_srcs)
+    set(cu_srcs)
+    set(hip_srcs)
+    set(math_common_deps device_context framework_proto enforce)
+    if (WITH_GPU)
+        if (${CMAKE_CUDA_COMPILER_VERSION} LESS 11.0)	
+            list(APPEND math_common_deps cub)
+	else()
+            list(APPEND math_common_deps)
+	endif()
+    endif()
+    set(multiValueArgs DEPS)
+    cmake_parse_arguments(math_library "${options}" "${oneValueArgs}"
+            "${multiValueArgs}" ${ARGN})
+
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET}.cc)
+        list(APPEND cc_srcs ${TARGET}.cc)
+    endif()
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET}.cu)
+        list(APPEND cu_srcs ${TARGET}.cu)
+    endif()
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET}.cu.cc)
+        list(APPEND cu_srcs ${TARGET}.cu.cc)
+    endif()
+
+    list(LENGTH cc_srcs cc_srcs_len)
+    if (WITH_GPU)
+        nv_library(${TARGET} SRCS ${cc_srcs} ${cu_srcs} DEPS ${math_library_DEPS} ${math_common_deps})
+    elseif (WITH_ROCM)
+        hip_library(${TARGET} SRCS ${cc_srcs} ${cu_srcs} DEPS ${math_library_DEPS} ${math_common_deps})
+    elseif(${cc_srcs_len} GREATER 0)
+        cc_library(${TARGET} SRCS ${cc_srcs} DEPS ${math_library_DEPS} ${math_common_deps})
+    endif()
+endfunction()

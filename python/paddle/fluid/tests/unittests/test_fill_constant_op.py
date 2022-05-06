@@ -83,6 +83,27 @@ class TestFillConstantOp4(OpTest):
         self.check_output()
 
 
+@unittest.skipIf(not core.is_compiled_with_cuda(),
+                 "core is not compiled with CUDA")
+class TestFillConstantBF16Op(OpTest):
+    def setUp(self):
+        '''Test fill_constant op with specified value
+        '''
+        self.op_type = "fill_constant"
+        self.dtype = np.uint16
+        self.inputs = {}
+        self.attrs = {
+            'shape': [123, 92],
+            'value': 3.8,
+            'dtype': core.VarDesc.VarType.BF16
+        }
+        self.outputs = {'Out': convert_float_to_uint16(np.full((123, 92), 3.8))}
+
+    def test_check_output(self):
+        place = core.CUDAPlace(0)
+        self.check_output_with_place(place)
+
+
 class TestFillConstantOpWithSelectedRows(unittest.TestCase):
     def check_with_place(self, place):
         scope = core.Scope()
@@ -358,13 +379,6 @@ class TestFillConstantOpError(unittest.TestCase):
                 shape=[1],
                 value=5,
                 dtype='uint4')
-            self.assertRaises(
-                TypeError,
-                fluid.layers.fill_constant,
-                shape=[1],
-                value=5,
-                dtype='int16',
-                out=x1)
 
             self.assertRaises(
                 TypeError,
@@ -375,7 +389,7 @@ class TestFillConstantOpError(unittest.TestCase):
                 out=x1)
 
             # The argument dtype of fill_constant_op must be one of bool, float16,
-            #float32, float64, uint8, int32 or int64
+            #float32, float64, uint8, int16, int32 or int64
             x2 = fluid.layers.data(name='x2', shape=[1], dtype="int32")
 
             self.assertRaises(

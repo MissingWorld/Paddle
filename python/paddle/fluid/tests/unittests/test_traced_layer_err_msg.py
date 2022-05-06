@@ -1,4 +1,5 @@
 # Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved.
+# Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +16,6 @@
 import numpy as np
 import paddle
 import paddle.fluid as fluid
-import six
 import unittest
 import paddle.nn as nn
 import os
@@ -50,12 +50,11 @@ class TestTracedLayerErrMsg(unittest.TestCase):
         self.feature_size = 3
         self.fc_size = 2
         self.layer = self._train_simple_net()
-        if six.PY2:
-            self.type_str = 'type'
-        else:
-            self.type_str = 'class'
+        self.type_str = 'class'
 
     def test_trace_err(self):
+        if fluid.framework.in_dygraph_mode():
+            return
         with fluid.dygraph.guard():
             in_x = fluid.dygraph.to_variable(
                 np.random.random((self.batch_size, self.feature_size)).astype(
@@ -72,7 +71,7 @@ class TestTracedLayerErrMsg(unittest.TestCase):
                     self.layer, 3)
             self.assertEqual(
                 "The type of 'each element of inputs' in fluid.dygraph.jit.TracedLayer.trace must be fluid.Variable, but received <{} 'int'>.".
-                format(self.type_str, self.type_str), str(e.exception))
+                format(self.type_str), str(e.exception))
             with self.assertRaises(TypeError) as e:
                 dygraph_out, traced_layer = fluid.dygraph.TracedLayer.trace(
                     self.layer, [True, 1])
@@ -84,6 +83,8 @@ class TestTracedLayerErrMsg(unittest.TestCase):
                 self.layer, [in_x])
 
     def test_set_strategy_err(self):
+        if fluid.framework.in_dygraph_mode():
+            return
         with fluid.dygraph.guard():
             in_x = fluid.dygraph.to_variable(
                 np.random.random((self.batch_size, self.feature_size)).astype(
@@ -109,6 +110,8 @@ class TestTracedLayerErrMsg(unittest.TestCase):
                                       fluid.ExecutionStrategy())
 
     def test_save_inference_model_err(self):
+        if fluid.framework.in_dygraph_mode():
+            return
         with fluid.dygraph.guard():
             in_x = fluid.dygraph.to_variable(
                 np.random.random((self.batch_size, self.feature_size)).astype(
@@ -173,6 +176,8 @@ class TestTracedLayerErrMsg(unittest.TestCase):
 
 class TestOutVarWithNoneErrMsg(unittest.TestCase):
     def test_linear_net_with_none(self):
+        if fluid.framework.in_dygraph_mode():
+            return
         model = LinearNetWithNone(100, 16)
         in_x = paddle.to_tensor(np.random.random((4, 100)).astype('float32'))
         with self.assertRaises(TypeError):
@@ -190,6 +195,8 @@ class TestTracedLayerSaveInferenceModel(unittest.TestCase):
             shutil.rmtree(os.path.dirname(self.save_path))
 
     def test_mkdir_when_input_path_non_exist(self):
+        if fluid.framework.in_dygraph_mode():
+            return
         fc_layer = SimpleFCLayer(3, 4, 2)
         input_var = paddle.to_tensor(np.random.random([4, 3]).astype('float32'))
         with fluid.dygraph.guard():

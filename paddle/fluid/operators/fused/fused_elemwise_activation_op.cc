@@ -69,7 +69,7 @@ static bool IsSupportedCompound(const std::vector<std::string> &functors) {
           functors.size(), 2));
 
   static std::unordered_set<std::string> unary_fun = {"scale", "relu", "tanh",
-                                                      "sigmoid"};
+                                                      "sigmoid", "gelu"};
   static std::unordered_set<std::string> binary_fun = {"elementwise_add",
                                                        "elementwise_mul"};
 
@@ -159,8 +159,8 @@ class FusedElemwiseActivationOp : public framework::OperatorWithKernel {
  protected:
   framework::OpKernelType GetExpectedKernelType(
       const framework::ExecutionContext &ctx) const override {
-    PADDLE_ENFORCE_EQ(ctx.Input<framework::Tensor>("X")->type(),
-                      ctx.Input<framework::Tensor>("Y")->type(),
+    PADDLE_ENFORCE_EQ(ctx.Input<framework::Tensor>("X")->dtype(),
+                      ctx.Input<framework::Tensor>("Y")->dtype(),
                       platform::errors::InvalidArgument(
                           "The element's type of input should be the same."));
     return framework::OpKernelType(

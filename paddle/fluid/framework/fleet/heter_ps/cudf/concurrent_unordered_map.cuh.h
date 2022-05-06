@@ -12,6 +12,10 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * This source code refers to https://github.com/rapidsai/cudf
+ * and is licensed under the license found in the LICENSE file
+ * in the root directory of this source tree.
  */
 
 #ifndef CONCURRENT_UNORDERED_MAP_CUH
@@ -547,6 +551,7 @@ class concurrent_unordered_map : public managed {
         update_existing_value(existing_value, x, op);
 
         insert_success = true;
+        break;
       }
 
       current_index = (current_index + 1) % hashtbl_size;
@@ -765,7 +770,7 @@ x.second );
   unsigned long long get_num_collisions() const { return m_collisions; }
 
   void print() {
-    for (size_type i = 0; i < 10; ++i) {
+    for (size_type i = 0; i < 5; ++i) {
       std::cout << i << ": " << m_hashtbl_values[i].first << ","
                 << m_hashtbl_values[i].second << std::endl;
     }

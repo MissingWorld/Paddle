@@ -26,11 +26,6 @@ class EmptyGradOpMaker;
 namespace imperative {
 class OpBase;
 }  // namespace imperative
-namespace platform {
-struct CPUPlace;
-struct CUDAPlace;
-struct float16;
-}  // namespace platform
 }  // namespace paddle
 
 namespace paddle {
@@ -141,7 +136,7 @@ REGISTER_OP_CPU_KERNEL_FUNCTOR(memcpy, float, ops::MemcpyKernel, double,
                                ops::MemcpyKernel, plat::float16,
                                ops::MemcpyKernel);
 
-#ifdef PADDLE_WITH_CUDA
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
 REGISTER_OP_CUDA_KERNEL_FUNCTOR(memcpy, float, ops::MemcpyKernel, double,
                                 ops::MemcpyKernel, int, ops::MemcpyKernel,
                                 int64_t, ops::MemcpyKernel, bool,

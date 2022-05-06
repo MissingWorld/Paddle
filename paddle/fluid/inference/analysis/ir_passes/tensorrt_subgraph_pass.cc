@@ -20,7 +20,9 @@
 #include "paddle/fluid/inference/analysis/helper.h"
 #include "paddle/fluid/inference/tensorrt/convert/op_converter.h"
 #include "paddle/fluid/inference/tensorrt/engine.h"
+#include "paddle/fluid/inference/tensorrt/helper.h"
 #include "paddle/fluid/inference/tensorrt/op_teller.h"
+#include "paddle/fluid/inference/utils/io_utils.h"
 
 namespace paddle {
 namespace inference {
@@ -44,8 +46,11 @@ void analysis::TensorRtSubgraphPass::ApplyImpl(
               << " is diabled by config in TensorRT";
       return false;
     }
-    return tensorrt::OpTeller::Global().Tell(node, no_calib_int8,
-                                             with_dynamic_shape);
+    bool is_ok = tensorrt::OpTeller::Global().Tell(node, no_calib_int8,
+                                                   with_dynamic_shape);
+    if (!is_ok)
+      VLOG(3) << node->Op()->Type().c_str() << " op is not in TensorRT";
+    return is_ok;
   };
 
   framework::ir::SubGraphFuser fuser(
@@ -196,6 +201,17 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
   auto opt_input_shape =
       Get<std::map<std::string, std::vector<int>>>("optim_input_shape");
 
+  auto allow_build_at_runtime = Get<bool>("trt_allow_build_at_runtime");
+  auto shape_range_info_path = Get<std::string>("trt_shape_range_info_path");
+  auto trt_tuned_dynamic_shape = Get<bool>("trt_tuned_dynamic_shape");
+  int max_batch_size = Get<int>("max_batch_size");
+  if (trt_tuned_dynamic_shape) {
+    VLOG(1) << "trt dynamic_shape deserialize from " << shape_range_info_path;
+    inference::DeserializeShapeRangeInfo(shape_range_info_path,
+                                         &min_input_shape, &max_input_shape,
+                                         &opt_input_shape);
+  }
+
   // The following procedure is used to rename all the intermediate
   // variables and the output variables of the subgraph.
   // Why we do this?
@@ -241,12 +257,15 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
 
   op_desc->SetBlockAttr("sub_block", new_block);
   op_desc->SetAttr("subgraph", block_desc.Proto()->SerializeAsString());
-  op_desc->SetAttr("max_batch_size", Get<int>("max_batch_size"));
+  op_desc->SetAttr("max_batch_size", max_batch_size);
   op_desc->SetAttr("workspace_size", Get<int>("workspace_size"));
   op_desc->SetAttr("gpu_id", Get<int>("gpu_device_id"));
   op_desc->SetAttr("output_name_mapping", output_mapping);
   op_desc->SetAttr("origin_output_dims", renamed_output_dims);
   op_desc->SetAttr("parameters", params);
+  op_desc->SetAttr("allow_build_at_runtime", allow_build_at_runtime);
+  op_desc->SetAttr("shape_range_info_path", shape_range_info_path);
+  op_desc->SetAttr("use_inspector", Get<bool>("use_inspector"));
 
   // we record all inputs' shapes in attr to check if they are consistent
   // with the real inputs' shapes retrieved from scope when trt runs.
@@ -258,6 +277,11 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
   }
 
   auto use_static_engine = Get<bool>("use_static_engine");
+  op_desc->SetAttr("use_static_engine", use_static_engine);
+  if (use_static_engine)
+    op_desc->SetAttr("model_opt_cache_dir",
+                     Get<std::string>("model_opt_cache_dir"));
+
   // TODO(NHZlX)
   // There are models with the same structure but the different parameters,
   // when running in the 'use_serialize' mode, there is a bug.
@@ -265,12 +289,12 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
   // So we use seperate engine keys in serialization and calibration.
   auto engine_key = GenerateEngineKey(
       input_names_with_id, output_names_with_id, std::to_string(0),
-      std::to_string(Get<int>("max_batch_size")),
+      std::to_string(max_batch_size),
       std::to_string(static_cast<int>(precision_mode)), false);
-  auto calibration_engine_key = GenerateEngineKey(
-      input_names_with_id, output_names_with_id, std::to_string(0),
-      std::to_string(Get<int>("max_batch_size")),
-      std::to_string(static_cast<int>(precision_mode)), true);
+  auto calibration_engine_key =
+      GenerateEngineKey(input_names_with_id, output_names_with_id,
+                        std::to_string(0), std::to_string(max_batch_size),
+                        std::to_string(static_cast<int>(precision_mode)), true);
   auto predictor_id = Get<int>("predictor_id");
 
   // Get "" when there is no cached calibration table data.
@@ -321,11 +345,20 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
     opt_input_shape = {};
   }
 
-  if (min_input_shape.size() > 0 && TRT_VERSION > 6000) {
+  auto to_major_version = [&](int full_version) -> float {
+    return (full_version / 100) / 10.0;
+  };
+  const float compile_time_trt_version = to_major_version(TRT_VERSION);
+  const float run_time_trt_version =
+      to_major_version(tensorrt::GetInferLibVersion());
+  if (compile_time_trt_version != run_time_trt_version) {
     LOG_FIRST_N(WARNING, 1)
-        << "The Paddle lib links the " << TRT_VERSION << " version TensorRT, "
-        << "make sure the runtime TensorRT you are using is no less than this "
-           "version, otherwise, there might be Segfault!";
+        << "The Paddle Inference library is compiled with "
+        << compile_time_trt_version << " version TensorRT, "
+        << "but the runtime TensorRT you are using is " << run_time_trt_version
+        << " version. "
+           "This might cause serious compatibility issues. We strongly "
+           "recommend using the same TRT version at runtime.";
   }
 
   // Setting the disable_trt_plugin_fp16 to true means that TRT plugin will not
@@ -335,18 +368,21 @@ void TensorRtSubgraphPass::CreateTensorRTOp(
   bool disable_trt_plugin_fp16 = Get<bool>("disable_trt_plugin_fp16");
   tensorrt::TensorRTEngine *trt_engine =
       inference::Singleton<inference::tensorrt::TRTEngineManager>::Global()
-          .Create(engine_key + std::to_string(predictor_id),
-                  Get<int>("max_batch_size"), Get<int>("workspace_size"),
-                  precision_mode, calibrator.get(), Get<int>("gpu_device_id"),
-                  min_input_shape, max_input_shape, opt_input_shape,
-                  disable_trt_plugin_fp16);
+          .Create(engine_key + std::to_string(predictor_id), max_batch_size,
+                  Get<int>("workspace_size"), precision_mode, calibrator.get(),
+                  Get<int>("gpu_device_id"), min_input_shape, max_input_shape,
+                  opt_input_shape, disable_trt_plugin_fp16);
   trt_engine->SetUseOSS(Get<bool>("use_oss"));
+  trt_engine->SetWithInterleaved(Get<bool>("with_interleaved"));
   trt_engine->SetUseDLA(Get<bool>("trt_use_dla"));
   trt_engine->SetDLACore(Get<int>("trt_dla_core"));
+  trt_engine->SetUseInspector(Get<bool>("use_inspector"));
 
   trt_engine->SetWithErnie(
-      graph->Has(framework::ir::kEmbEltwiseLayernormPass) &&
-      graph->Has(framework::ir::kMultiheadMatmulPass));
+      (graph->Has(framework::ir::kEmbEltwiseLayernormPass) &&
+       graph->Has(framework::ir::kMultiheadMatmulPass)) ||
+      (graph->Has(framework::ir::kPrelnEmbEltwiseLayernormPass) &&
+       graph->Has(framework::ir::kMultiheadMatmulPass)));
 
   if (use_static_engine) {
     trt_engine_serialized_data = GetTrtEngineSerializedData(

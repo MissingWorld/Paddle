@@ -14,6 +14,7 @@
 
 from __future__ import print_function
 
+import paddle
 import unittest
 import numpy as np
 import math
@@ -30,6 +31,7 @@ class TestROIAlignOp(OpTest):
         self.inputs = {
             'X': self.x,
             'ROIs': (self.rois[:, 1:5], self.rois_lod),
+            'RoisNum': self.boxes_num
         }
         self.attrs = {
             'spatial_scale': self.spatial_scale,
@@ -129,8 +131,9 @@ class TestROIAlignOp(OpTest):
 
             roi_width = roi_xmax - roi_xmin
             roi_height = roi_ymax - roi_ymin
-            roi_width = max(roi_width, 1)
-            roi_height = max(roi_height, 1)
+            if not self.aligned:
+                roi_width = max(roi_width, 1)
+                roi_height = max(roi_height, 1)
 
             bin_size_h = float(roi_height) / float(self.pooled_height)
             bin_size_w = float(roi_width) / float(self.pooled_width)
@@ -138,7 +141,7 @@ class TestROIAlignOp(OpTest):
                                  math.ceil(roi_height / self.pooled_height)
             roi_bin_grid_w = self.sampling_ratio if self.sampling_ratio > 0 else \
                                  math.ceil(roi_width / self.pooled_width)
-            count = int(roi_bin_grid_h * roi_bin_grid_w)
+            count = max(int(roi_bin_grid_h * roi_bin_grid_w), 1)
             pre_size = count * self.pooled_width * self.pooled_height
             bilinear_pos, bilinear_w = self.pre_calc(x_i, roi_xmin, roi_ymin,
                                                      int(roi_bin_grid_h),
@@ -169,16 +172,19 @@ class TestROIAlignOp(OpTest):
                 rois.append(roi)
         self.rois_num = len(rois)
         self.rois = np.array(rois).astype("float64")
+        self.boxes_num = np.array(
+            [bno + 1 for bno in range(self.batch_size)]).astype('int32')
 
     def setUp(self):
         self.op_type = "roi_align"
+        self.python_api = lambda x, boxes, boxes_num, pooled_height, pooled_width, spatial_scale, sampling_ratio, aligned: paddle.vision.ops.roi_align(x, boxes, boxes_num, (pooled_height, pooled_width), spatial_scale, sampling_ratio, aligned)
         self.set_data()
 
     def test_check_output(self):
-        self.check_output()
+        self.check_output(check_eager=True)
 
     def test_check_grad(self):
-        self.check_grad(['X'], 'Out')
+        self.check_grad(['X'], 'Out', check_eager=True)
 
 
 class TestROIAlignInLodOp(TestROIAlignOp):

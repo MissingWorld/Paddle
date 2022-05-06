@@ -32,7 +32,7 @@ limitations under the License. */
 #include <utility>
 #include <vector>
 #include "paddle/fluid/framework/fleet/ascend_wrapper.h"
-#include "paddle/fluid/platform/ascend_npu_info.h"
+#include "paddle/fluid/platform/device/npu/ascend_npu_info.h"
 #include "paddle/fluid/platform/enforce.h"
 #include "paddle/fluid/pybind/ascend_wrapper_py.h"
 
@@ -108,12 +108,14 @@ enum AttrType {
   AT_NAMEATTR
 };
 
+#ifdef PADDLE_WITH_ASCEND
 void BindAscendDevice(py::module *m) {
   py::class_<platform::ascend::NPUDevice>(*m, "NPUDevice")
       .def_static(
           "get_device_count",
           static_cast<int (*)()>(&platform::ascend::NPUDevice::GetDeviceCount));
 }
+#endif
 
 void BindAscendGraph(py::module *m) {
   m->def("ge_initialize", &ge_initialize, "GEInitialize");

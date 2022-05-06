@@ -38,38 +38,6 @@ class BatchNormOpConverter : public OpConverter {
     VLOG(3) << "convert a fluid batch norm op to tensorrt batch_norm";
 
     framework::OpDesc op_desc(op, nullptr);
-    PADDLE_ENFORCE_EQ(op_desc.Input("X").size(), 1,
-                      platform::errors::InvalidArgument(
-                          "Invalid input X's size of batch_norm TRT converter. "
-                          "Expected 1, received %d.",
-                          op_desc.Input("X").size()));
-    PADDLE_ENFORCE_EQ(op_desc.Input("Bias").size(), 1,
-                      platform::errors::InvalidArgument(
-                          "Invalid input Bias's size of batch_norm TRT "
-                          "converter. Expected 1, received %d.",
-                          op_desc.Input("Bias").size()));  // Bias is a weight
-    PADDLE_ENFORCE_EQ(op_desc.Input("Mean").size(), 1,
-                      platform::errors::InvalidArgument(
-                          "Invalid input Mean's size of batch_norm TRT "
-                          "converter. Expected 1, received %d.",
-                          op_desc.Input("Mean").size()));  // Mean is a weight
-    PADDLE_ENFORCE_EQ(op_desc.Input("Scale").size(), 1,
-                      platform::errors::InvalidArgument(
-                          "Invalid input Scale's size of batch_norm TRT "
-                          "converter. Expected 1, received %d.",
-                          op_desc.Input("Scale").size()));  // Scale is a weight
-    PADDLE_ENFORCE_EQ(
-        op_desc.Input("Variance").size(), 1,
-        platform::errors::InvalidArgument(
-            "Invalid input Variance's size of batch_norm TRT converter. "
-            "Expected 1, received %d.",
-            op_desc.Input("Variance").size()));  // Variance is a weight
-    PADDLE_ENFORCE_EQ(op_desc.Output("Y").size(), 1,
-                      platform::errors::InvalidArgument(
-                          "Invalid output Y's size of batch_norm TRT "
-                          "converter. Expected 1, received %d.",
-                          op_desc.Output("Y").size()));
-
     auto* X = engine_->GetITensor(op_desc.Input("X").front());
     // Declare weights
     auto* Bias_v = scope.FindVar(op_desc.Input("Bias").front());
@@ -77,7 +45,7 @@ class BatchNormOpConverter : public OpConverter {
     auto* Scale_v = scope.FindVar(op_desc.Input("Scale").front());
     auto* Variance_v = scope.FindVar(op_desc.Input("Variance").front());
     const float eps = BOOST_GET_CONST(float, op_desc.GetAttr("epsilon"));
-
+    auto output_name = op_desc.Output("Y").front();
     PADDLE_ENFORCE_NOT_NULL(
         Bias_v,
         platform::errors::NotFound(
@@ -114,10 +82,11 @@ class BatchNormOpConverter : public OpConverter {
 
     platform::CPUPlace cpu_place;
     // copy data from gpu to cpu
-    TensorCopySync((*Bias_t), cpu_place, &bias_tensor);
-    TensorCopySync((*Mean_t), cpu_place, &mean_tensor);
-    TensorCopySync((*Scale_t), cpu_place, &scale_tensor);
-    TensorCopySync((*Variance_t), cpu_place, &variance_tensor);
+    paddle::framework::TensorCopySync((*Bias_t), cpu_place, &bias_tensor);
+    paddle::framework::TensorCopySync((*Mean_t), cpu_place, &mean_tensor);
+    paddle::framework::TensorCopySync((*Scale_t), cpu_place, &scale_tensor);
+    paddle::framework::TensorCopySync((*Variance_t), cpu_place,
+                                      &variance_tensor);
 
     auto* bias_data = bias_tensor.mutable_data<float>(platform::CPUPlace());
     auto* mean_data = mean_tensor.mutable_data<float>(platform::CPUPlace());
@@ -177,18 +146,24 @@ class BatchNormOpConverter : public OpConverter {
       expand_layer = TRT_ENGINE_ADD_LAYER(engine_, Shuffle, *X);
       expand_layer->setReshapeDimensions(expand_shape);
       X = expand_layer->getOutput(0);
+      expand_layer->getOutput(0)->setName(
+          ("reshape_before_batchnorm_out: " + output_name).c_str());
+      expand_layer->setName(
+          ("BN_Shuffle: (Output: " + output_name + ")").c_str());
     }
 
-    layer = TRT_ENGINE_ADD_LAYER(
-        engine_, Scale, *X, nvinfer1::ScaleMode::kCHANNEL, shift_weights.get(),
-        scale_weights.get(), power_weights.get());
+    layer = TRT_ENGINE_ADD_LAYER(engine_, ScaleNd, *X,
+                                 nvinfer1::ScaleMode::kCHANNEL,
+                                 shift_weights.get(), scale_weights.get(),
+                                 power_weights.get(), dynamic_shape_offset);
 
-    auto output_name = op_desc.Output("Y").front();
     engine_->SetWeights(op_desc.Input("Bias").front(),
                         std::move(combile_bias_tensor));
     engine_->SetWeights(op_desc.Input("Scale").front(),
                         std::move(combile_scale_tensor));
     if (x_dim.nbDims < 3 + dynamic_shape_offset) {
+      layer->getOutput(0)->setName("batch_norm_out");
+      layer->setName(("BN: ScaleNd: (Output: " + output_name + ")").c_str());
       nvinfer1::Dims squeeze_shape;
       squeeze_shape.nbDims = x_dim.nbDims;
       for (int i = 0; i < squeeze_shape.nbDims; i++) {
@@ -197,10 +172,12 @@ class BatchNormOpConverter : public OpConverter {
       squeeze_layer =
           TRT_ENGINE_ADD_LAYER(engine_, Shuffle, *(layer->getOutput(0)));
       squeeze_layer->setReshapeDimensions(squeeze_shape);
-      layer = static_cast<nvinfer1::ILayer*>(squeeze_layer);
+      RreplenishLayerAndOutput(squeeze_layer, "batchnorm_add_scale",
+                               {output_name}, test_mode);
+    } else {
+      RreplenishLayerAndOutput(layer, "batchnorm_add_scale", {output_name},
+                               test_mode);
     }
-    RreplenishLayerAndOutput(layer, "batchnorm_add_scale", {output_name},
-                             test_mode);
   }
 };
 

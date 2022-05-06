@@ -51,6 +51,7 @@ class RoiAlignOpConverter : public OpConverter {
         BOOST_GET_CONST(float, op_desc.GetAttr("spatial_scale"));
     const auto sampling_ratio =
         BOOST_GET_CONST(int, op_desc.GetAttr("sampling_ratio"));
+    const auto aligned = BOOST_GET_CONST(bool, op_desc.GetAttr("aligned"));
 
     const auto input_tensor = engine_->GetITensor(input_name);
     const auto rois_tensor = engine_->GetITensor(rois_name);
@@ -62,14 +63,9 @@ class RoiAlignOpConverter : public OpConverter {
     std::vector<nvinfer1::ITensor*> inputs{input_tensor, rois_tensor};
     nvinfer1::ILayer* layer = nullptr;
 
-    PADDLE_ENFORCE_EQ(
-        engine_->with_dynamic_shape(), true,
-        platform::errors::InvalidArgument(
-            "TRT roi align plugin only accept the dynamic shape, because that "
-            "the roi_align will change the batch size."));
-
     auto* roi_align_plugin = new plugin::RoiAlignPluginDynamic(
-        data_type_, pooled_height, pooled_width, spatial_scale, sampling_ratio);
+        data_type_, pooled_height, pooled_width, spatial_scale, sampling_ratio,
+        aligned);
     auto roi_align_layer = engine_->network()->addPluginV2(
         inputs.data(), inputs.size(), *roi_align_plugin);
     layer = roi_align_layer;

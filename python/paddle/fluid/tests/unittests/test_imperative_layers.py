@@ -15,12 +15,16 @@
 import unittest
 import paddle
 import paddle.nn as nn
+from paddle.fluid.framework import _test_eager_guard, _non_static_mode
 
 
 class TestLayerPrint(unittest.TestCase):
-    def test_layer_str(self):
+    def func_test_layer_str(self):
         module = nn.ELU(0.2)
         self.assertEqual(str(module), 'ELU(alpha=0.2)')
+
+        module = nn.CELU(0.2)
+        self.assertEqual(str(module), 'CELU(alpha=0.2)')
 
         module = nn.GELU(True)
         self.assertEqual(str(module), 'GELU(approximate=True)')
@@ -38,10 +42,11 @@ class TestLayerPrint(unittest.TestCase):
         self.assertEqual(
             str(module), 'Hardtanh(min=-1.0, max=1.0, name=Hardtanh)')
 
-        module = nn.PReLU(1, 0.25, name="PReLU")
+        module = nn.PReLU(1, 0.25, name="PReLU", data_format="NCHW")
         self.assertEqual(
             str(module),
-            'PReLU(num_parameters=1, init=0.25, dtype=float32, name=PReLU)')
+            'PReLU(num_parameters=1, data_format=NCHW, init=0.25, dtype=float32, name=PReLU)'
+        )
 
         module = nn.ReLU()
         self.assertEqual(str(module), 'ReLU()')
@@ -143,6 +148,10 @@ class TestLayerPrint(unittest.TestCase):
             'Pad2D(padding=[1, 0, 1, 2], mode=constant, value=0.0, data_format=NCHW)'
         )
 
+        module = nn.ZeroPad2D(padding=[1, 0, 1, 2])
+        self.assertEqual(
+            str(module), 'ZeroPad2D(padding=[1, 0, 1, 2], data_format=NCHW)')
+
         module = nn.Pad3D(padding=[1, 0, 1, 2, 0, 0], mode='constant')
         self.assertEqual(
             str(module),
@@ -210,7 +219,8 @@ class TestLayerPrint(unittest.TestCase):
         module = nn.BatchNorm1D(1)
         self.assertEqual(
             str(module),
-            'BatchNorm1D(num_features=1, momentum=0.9, epsilon=1e-05)')
+            'BatchNorm1D(num_features=1, momentum=0.9, epsilon=1e-05, data_format=NCL)'
+        )
 
         module = nn.BatchNorm2D(1)
         self.assertEqual(
@@ -220,7 +230,8 @@ class TestLayerPrint(unittest.TestCase):
         module = nn.BatchNorm3D(1)
         self.assertEqual(
             str(module),
-            'BatchNorm3D(num_features=1, momentum=0.9, epsilon=1e-05)')
+            'BatchNorm3D(num_features=1, momentum=0.9, epsilon=1e-05, data_format=NCDHW)'
+        )
 
         module = nn.SyncBatchNorm(2)
         self.assertEqual(
@@ -341,6 +352,11 @@ class TestLayerPrint(unittest.TestCase):
             '(5): MaxPool3D(kernel_size=2, stride=2, padding=0)\n  '\
             '(6): GELU(approximate=True)\n)'
         )
+
+    def test_layer_str(self):
+        with _test_eager_guard():
+            self.func_test_layer_str()
+        self.func_test_layer_str()
 
 
 if __name__ == '__main__':

@@ -23,8 +23,9 @@ limitations under the License. */
 #include <unordered_map>
 #include <vector>
 
-#ifdef PADDLE_WITH_PSLIB
+#if defined(PADDLE_WITH_PSLIB) && !defined(PADDLE_WITH_HETERPS)
 #include "paddle/fluid/framework/heter_service.h"
+#include "paddle/fluid/framework/heter_util.h"
 #include "paddle/fluid/framework/scope.h"
 #include "paddle/fluid/framework/tensor.h"
 #include "paddle/fluid/framework/variable_helper.h"

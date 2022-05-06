@@ -18,6 +18,8 @@ import paddle
 from collections import OrderedDict
 from paddle.static import Program, program_guard, Variable
 
+__all__ = []
+
 
 class VarWrapper(object):
     def __init__(self, var, graph):
@@ -174,6 +176,7 @@ def count_element_op(op):
 def _graph_flops(graph, detail=False):
     assert isinstance(graph, GraphWrapper)
     flops = 0
+    op_flops = 0
     table = Table(["OP Type", 'Param name', "Flops"])
     for op in graph.ops():
         param_name = ''

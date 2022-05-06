@@ -52,9 +52,9 @@ class LookupTableOp : public framework::OperatorWithKernel {
             ids_dims[ids_rank - 1], ids_dims));
 
     auto output_dims =
-        framework::vectorize(framework::slice_ddim(ids_dims, 0, ids_rank - 1));
+        phi::vectorize(phi::slice_ddim(ids_dims, 0, ids_rank - 1));
     output_dims.push_back(table_dims[1]);
-    ctx->SetOutputDim("Out", framework::make_ddim(output_dims));
+    ctx->SetOutputDim("Out", phi::make_ddim(output_dims));
 
     if (ctx->GetOutputsVarType("Out")[0] ==
         framework::proto::VarType::LOD_TENSOR) {
@@ -116,6 +116,11 @@ class LookupTableOpMaker : public framework::OpProtoAndCheckerMaker {
     AddAttr<std::string>("entry",
                          "(std::string, default "
                          ") for entry attribute.")
+        .SetDefault("none");
+
+    AddAttr<std::string>("table_class",
+                         "(std::string, default "
+                         ") for table_class.")
         .SetDefault("none");
 
     AddAttr<std::vector<std::string>>(
@@ -224,6 +229,7 @@ REGISTER_OPERATOR(lookup_table_grad, ops::LookupTableOpGrad,
 REGISTER_OP_CPU_KERNEL(lookup_table, ops::LookupTableKernel<float>,
                        ops::LookupTableKernel<double>,
                        ops::LookupTableKernel<int8_t>,
+                       ops::LookupTableKernel<int16_t>,
                        ops::LookupTableKernel<paddle::platform::bfloat16>);
 REGISTER_OP_CPU_KERNEL(lookup_table_grad, ops::LookupTableGradKernel<float>,
                        ops::LookupTableGradKernel<double>,
